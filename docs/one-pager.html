@@ -1,0 +1,719 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>pi-subagent - one tool, a whole agent tree</title>
+<script src="https://cdn.jsdelivr.net/npm/gsap@3.12.5/dist/gsap.min.js"></script>
+<style>
+  :root {
+    --ink: #171717;
+    --muted: #6b6b6b;
+    --faint: #a3a3a3;
+    --border: #e5e5e5;
+    --red: #cc071e;
+    --red-soft: #fdecee;
+    --gold: #b08a2e;
+    --gold-soft: #fffdf6;
+    --green: #1e7a3c;
+    --green-soft: #e8f5ec;
+    --blue: #2f6fd0;
+    --blue-soft: #eef4fd;
+    --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  html { scroll-behavior: smooth; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    color: var(--ink);
+    background: #fafafa;
+    padding: 48px 24px 72px;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; }
+  .eyebrow {
+    font-family: var(--mono); font-size: 11px; letter-spacing: 0.14em;
+    text-transform: uppercase; color: var(--red); font-weight: 600;
+  }
+  code, .mono { font-family: var(--mono); }
+  p code, li code, h3 code {
+    font-size: 0.88em; background: #f0f0f0; padding: 1px 5px; border-radius: 4px;
+  }
+  section { margin-top: 56px; }
+  h2 { font-size: 22px; letter-spacing: -0.01em; }
+  h2 + p.lead { margin-top: 6px; color: var(--muted); max-width: 660px; line-height: 1.55; font-size: 15px; }
+
+  /* ── Hero ─────────────────────────────────────────── */
+  header.hero h1 { font-size: 34px; letter-spacing: -0.02em; margin-top: 8px; }
+  header.hero > p {
+    margin-top: 10px; color: var(--muted); max-width: 680px; line-height: 1.6; font-size: 16px;
+  }
+  .hero-row { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-top: 18px; }
+  .install {
+    font-family: var(--mono); font-size: 13px; background: var(--ink); color: #fff;
+    padding: 10px 16px; border-radius: 10px; user-select: all;
+  }
+  .install span { color: #8f8f8f; }
+  .badge {
+    font-family: var(--mono); font-size: 11px; padding: 5px 10px; border-radius: 999px;
+    border: 1px solid var(--border); background: #fff; color: var(--muted);
+  }
+
+  .card {
+    background: #fff; border: 1px solid var(--border); border-radius: 16px;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+  }
+
+  /* ── Demo ─────────────────────────────────────────── */
+  .demo { display: grid; grid-template-columns: minmax(300px, 1fr) auto; gap: 40px; padding: 32px; align-items: center; }
+  @media (max-width: 920px) { .demo { grid-template-columns: 1fr; justify-items: center; } }
+
+  ol.steps { list-style: none; padding: 0; }
+  ol.steps li { display: flex; gap: 16px; }
+  .dotcol { display: flex; flex-direction: column; align-items: center; }
+  .stepdot {
+    width: 40px; height: 40px; border-radius: 50%; border: 2px solid #d4d4d4;
+    display: grid; place-items: center; font-weight: 600; font-size: 14px;
+    color: var(--faint); flex-shrink: 0; transition: all .3s; background: #fff;
+  }
+  li.active .stepdot { border-color: var(--red); color: var(--red); background: var(--red-soft); box-shadow: 0 0 0 4px #fbdfe2; }
+  li.done .stepdot { border-color: var(--green); background: var(--green); color: #fff; }
+  .rail { width: 2px; flex: 1; background: #e5e5e5; margin: 4px 0; border-radius: 2px; overflow: hidden; }
+  .rail > div { width: 100%; height: 0; background: var(--gold); transition: height .5s; }
+  li.done .rail > div { height: 100%; }
+  .steptext { padding: 2px 0 22px; transition: opacity .3s; opacity: 0.45; }
+  li.active .steptext, li.done .steptext { opacity: 1; }
+  .steptext .station { font-family: var(--mono); font-size: 10px; letter-spacing: .14em; text-transform: uppercase; color: var(--red); font-weight: 600; }
+  .steptext h3 { font-size: 15px; margin-top: 2px; }
+  .steptext p { font-size: 13px; line-height: 1.5; color: var(--muted); margin-top: 3px; max-width: 340px; }
+
+  .stage { display: flex; flex-direction: column; align-items: center; gap: 18px; }
+  .canvas {
+    position: relative; width: 440px; height: 580px; background: #fff;
+    border: 1px solid var(--border); border-radius: 12px; overflow: hidden;
+    box-shadow: 0 1px 3px rgba(0,0,0,.05);
+  }
+  .anim { opacity: 0; }
+
+  .agentcard {
+    position: absolute; background: #fff; border: 1px solid var(--border);
+    border-radius: 10px; padding: 9px 11px; box-shadow: 0 1px 3px rgba(0,0,0,.06);
+  }
+  .agentcard .tag { font-family: var(--mono); font-size: 8px; letter-spacing: .13em; text-transform: uppercase; color: var(--faint); }
+  .agentcard .name { font-size: 12.5px; font-weight: 650; margin-top: 1px; }
+  .agentcard .model { font-family: var(--mono); font-size: 9px; color: var(--muted); margin-top: 1px; }
+  .agentcard .line { font-family: var(--mono); font-size: 9px; margin-top: 5px; color: var(--blue); white-space: pre-wrap; word-break: break-all; }
+  .status { display: inline-flex; align-items: center; gap: 5px; font-family: var(--mono); font-size: 9px; color: var(--muted); margin-top: 6px; }
+  .status i { width: 7px; height: 7px; border-radius: 50%; background: var(--green); display: inline-block; }
+  .status.busy i { background: var(--gold); }
+  .status.resumed i { background: var(--blue); }
+
+  #root-card { left: 120px; top: 14px; width: 200px; }
+  #ctx-card  { left: 8px;  top: 14px; width: 104px; padding: 8px 9px; }
+  #ctx-card .cl { font-family: var(--mono); font-size: 8px; line-height: 1.7; white-space: nowrap; }
+  .cl.keep::after { content: " \2713"; color: var(--green); }
+  .cl.drop { color: var(--faint); }
+  .cl.drop.struck { text-decoration: line-through; opacity: .45; }
+
+  #coord {
+    position: absolute; left: 150px; top: 138px; width: 140px; height: 24px;
+    border: 1px solid var(--gold); border-radius: 999px; display: grid; place-items: center;
+    font-family: var(--mono); font-size: 8.5px; letter-spacing: .1em; text-transform: uppercase; color: var(--gold);
+    background: var(--gold-soft);
+  }
+  #packet {
+    position: absolute; left: 60px; top: 60px; padding: 2px 7px; border-radius: 999px;
+    background: var(--green-soft); border: 1px solid var(--green); color: var(--green);
+    font-family: var(--mono); font-size: 8px; white-space: nowrap;
+  }
+
+  .child { top: 200px; width: 128px; }
+  #child-0 { left: 12px; }  #child-1 { left: 156px; }  #child-2 { left: 300px; }
+  .child .cmd { font-family: var(--mono); font-size: 8.5px; margin-top: 5px; color: var(--muted); white-space: nowrap; }
+  .child .cmd.danger { color: var(--red); font-weight: 600; }
+  #depth2 { left: 16px; top: 340px; width: 118px; padding: 7px 9px; }
+  #depth2 .name { font-size: 11px; }
+
+  #meter { position: absolute; top: 10px; right: 12px; text-align: right; }
+  #meter .lbl { font-family: var(--mono); font-size: 8px; letter-spacing: .12em; text-transform: uppercase; color: var(--faint); }
+  #meter .dots { display: flex; gap: 4px; justify-content: flex-end; margin-top: 4px; }
+  #meter .dots i { width: 9px; height: 9px; border-radius: 50%; border: 1.5px solid #d4d4d4; background: #fff; transition: all .3s; }
+  #meter .dots i.on { border-color: var(--gold); background: var(--gold); }
+
+  #gate-bubble {
+    position: absolute; left: 96px; top: 118px; width: 250px; z-index: 5;
+    background: #fff; border: 1.5px solid var(--red); border-radius: 10px;
+    padding: 8px 11px; box-shadow: 0 4px 14px rgba(204,7,30,.14);
+  }
+  #gate-bubble .who { font-family: var(--mono); font-size: 8px; letter-spacing: .12em; text-transform: uppercase; color: var(--red); font-weight: 700; }
+  #gate-bubble .cmd { font-family: var(--mono); font-size: 10px; margin-top: 3px; }
+  #gate-bubble .ans { margin-top: 6px; font-size: 10px; font-family: var(--mono); }
+  #gate-bubble .ans .allow { color: var(--green); font-weight: 700; }
+
+  .envelope {
+    position: absolute; left: 12px; width: 416px; background: #fff;
+    border: 1px solid var(--border); border-left: 3px solid var(--green);
+    border-radius: 8px; padding: 6px 10px;
+  }
+  .envelope .head { font-family: var(--mono); font-size: 8.5px; color: var(--muted); }
+  .envelope .head b { color: var(--ink); }
+  .envelope .body { font-family: var(--mono); font-size: 9px; margin-top: 2px; color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .envelope .trunc { font-family: var(--mono); font-size: 8px; color: var(--gold); margin-top: 2px; }
+  #env-0 { top: 362px; } #env-1 { top: 412px; } #env-2 { top: 470px; }
+
+  .chip {
+    position: absolute; top: 528px; width: 130px; background: var(--gold-soft);
+    border: 1px dashed var(--gold); border-radius: 8px; padding: 5px 8px;
+    font-family: var(--mono); font-size: 8px; color: var(--gold); line-height: 1.5;
+  }
+  #chip-0 { left: 12px; } #chip-1 { left: 155px; } #chip-2 { left: 298px; }
+  .chip b { color: var(--ink); font-weight: 600; }
+
+  svg.wires { position: absolute; inset: 0; pointer-events: none; }
+  svg.wires path, svg.wires line { fill: none; }
+  .wire { stroke: #d9d0b8; stroke-width: 1.5; }
+  .wire-gate { stroke: var(--red); stroke-width: 1.5; stroke-dasharray: 5 4; }
+  .wire-resume { stroke: var(--blue); stroke-width: 1.5; stroke-dasharray: 5 4; }
+
+  .controls { display: flex; align-items: center; gap: 8px; }
+  .controls button {
+    font: 600 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    padding: 8px 16px; border-radius: 10px; border: 1px solid var(--border);
+    background: #fff; cursor: pointer; color: var(--ink); transition: all .15s;
+  }
+  .controls button:hover:not(:disabled) { border-color: #c9c9c9; background: #fafafa; }
+  .controls button:disabled { opacity: .4; cursor: default; }
+  #countdown { width: 100px; font-family: var(--mono); font-size: 11px; color: var(--faint); opacity: 0; transition: opacity .3s; }
+  #countdown.show { opacity: 1; }
+
+  /* ── Feature grid ─────────────────────────────────── */
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; margin-top: 22px; }
+  .feature { padding: 20px 22px; }
+  .feature .fl { font-family: var(--mono); font-size: 10px; letter-spacing: .13em; text-transform: uppercase; color: var(--gold); font-weight: 600; }
+  .feature h3 { font-size: 16px; margin-top: 5px; letter-spacing: -0.01em; }
+  .feature ul { margin: 10px 0 0; padding: 0; list-style: none; }
+  .feature li { font-size: 13.5px; line-height: 1.55; color: var(--muted); padding-left: 18px; position: relative; margin-top: 6px; }
+  .feature li::before { content: "\2013"; position: absolute; left: 2px; color: var(--gold); }
+  .feature li b { color: var(--ink); font-weight: 600; }
+
+  /* ── Code panels ──────────────────────────────────── */
+  .panels { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; margin-top: 22px; }
+  .panel { overflow: hidden; }
+  .panel .ph {
+    font-family: var(--mono); font-size: 11px; color: var(--muted);
+    padding: 10px 16px; border-bottom: 1px solid var(--border); background: #fcfcfc;
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .panel pre {
+    font-family: var(--mono); font-size: 12px; line-height: 1.65; padding: 16px 18px;
+    overflow-x: auto; color: var(--ink);
+  }
+  .panel .c  { color: var(--faint); }
+  .panel .k  { color: var(--blue); }
+  .panel .s  { color: var(--green); }
+  .panel .n  { color: var(--gold); }
+
+  /* ── Architecture strip ───────────────────────────── */
+  .arch { padding: 24px 28px; margin-top: 22px; }
+  .arch ol { margin: 0; padding-left: 20px; }
+  .arch li { font-size: 14px; line-height: 1.7; color: var(--muted); margin-top: 6px; }
+  .arch li b { color: var(--ink); font-weight: 600; }
+
+  footer.page {
+    margin-top: 56px; padding-top: 24px; border-top: 1px solid var(--border);
+    display: flex; flex-wrap: wrap; gap: 10px 28px; align-items: center;
+  }
+  footer.page span, footer.page a { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+  footer.page a { color: var(--blue); text-decoration: none; }
+  footer.page a:hover { text-decoration: underline; }
+
+  /* ── Static fallback (reduced motion / no GSAP) ───── */
+  body.static .anim { opacity: 1 !important; transform: none !important; }
+  /* Show the finished state, not every transient overlay at once. */
+  body.static #packet, body.static #gate-bubble, body.static #w-gate,
+  body.static #depth2, body.static #w-d2, body.static #danger-cmd { display: none; }
+  body.static .cl.drop { text-decoration: line-through; opacity: .45; }
+  body.static .controls { display: none; }
+  body.static .steptext { opacity: 1; }
+  body.static .stepdot { border-color: var(--green); background: var(--green); color: #fff; }
+  body.static #meter .dots i { border-color: #d4d4d4; background: #fff; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <!-- ═════════ Hero ═════════ -->
+  <header class="hero">
+    <div class="eyebrow">@nilskluewer/pi-subagent &middot; v0.5.0</div>
+    <h1>One tool. A whole agent tree.</h1>
+    <p>
+      A subagent extension for <a href="https://github.com/badlogic/pi-mono" style="color:var(--blue);text-decoration:none">pi</a>
+      that delegates work to isolated child processes: inline personas, forked context,
+      parallel councils, a root-scoped budget, one shared permission gate, and sessions
+      you can resume any time.
+    </p>
+    <div class="hero-row">
+      <div class="install"><span>$</span> pi install npm:@nilskluewer/pi-subagent</div>
+      <span class="badge">MIT</span>
+      <span class="badge">zero build step</span>
+      <span class="badge">61 tests</span>
+    </div>
+  </header>
+
+  <!-- ═════════ Animated walkthrough ═════════ -->
+  <section>
+    <h2>How a delegation runs</h2>
+    <p class="lead">Six stations, from the first tool call to a resumable session. Watch it play, or step through.</p>
+
+    <div class="card demo" style="margin-top:22px">
+      <ol class="steps" id="steps">
+        <li><div class="dotcol"><div class="stepdot">1</div><div class="rail"><div></div></div></div>
+          <div class="steptext"><div class="station">Delegate</div><h3>One tool, three modes</h3>
+          <p>The main agent calls <code>subagent</code> - single, parallel, or chain. Personas are inline system prompts; no setup files needed.</p></div></li>
+        <li><div class="dotcol"><div class="stepdot">2</div><div class="rail"><div></div></div></div>
+          <div class="steptext"><div class="station">Fork</div><h3>Context forking</h3>
+          <p><code>forkContext</code> seeds children with sanitized parent history: user messages and final answers kept, thinking and tool noise dropped.</p></div></li>
+        <li><div class="dotcol"><div class="stepdot">3</div><div class="rail"><div></div></div></div>
+          <div class="steptext"><div class="station">Spawn</div><h3>Isolated pi processes</h3>
+          <p>Every agent is a real <code>pi</code> child process. Children can nest to depth 2; a root-scoped budget caps live agents at 4 across the tree.</p></div></li>
+        <li><div class="dotcol"><div class="stepdot">4</div><div class="rail"><div></div></div></div>
+          <div class="steptext"><div class="station">Gate</div><h3>One permission gate</h3>
+          <p>Dangerous commands from any depth are proxied over the coordinator socket and prompt in the root TUI - labeled with the agent's name.</p></div></li>
+        <li><div class="dotcol"><div class="stepdot">5</div><div class="rail"><div></div></div></div>
+          <div class="steptext"><div class="station">Report</div><h3>Capped envelopes</h3>
+          <p>Results return as <code>[agent | model | status | session]</code> envelopes, capped at ~1000 tokens with a pointer to the full session file.</p></div></li>
+        <li><div class="dotcol"><div class="stepdot">6</div></div>
+          <div class="steptext"><div class="station">Resume</div><h3>Persistent sessions</h3>
+          <p>Every run is a session with <code>parent/rootId</code> lineage. Resume any agent later - it remembers everything.</p></div></li>
+      </ol>
+
+      <div class="stage">
+        <div class="canvas" id="canvas">
+          <svg class="wires" viewBox="0 0 440 580" width="440" height="580">
+            <path id="w-root"  class="wire anim" d="M220,110 V138" />
+            <path id="w-c0" class="wire anim" d="M220,162 C220,184 76,178 76,200" />
+            <path id="w-c1" class="wire anim" d="M220,162 V200" />
+            <path id="w-c2" class="wire anim" d="M220,162 C220,184 364,178 364,200" />
+            <path id="w-d2" class="wire anim" d="M76,312 V340" />
+            <path id="w-gate" class="wire-gate anim" d="M232,200 C232,168 268,148 268,112" />
+            <path id="w-resume" class="wire-resume anim" d="M220,526 V316" />
+            <polygon id="w-resume-tip" class="anim" points="220,310 215,321 225,321" fill="var(--blue)" />
+          </svg>
+
+          <div id="meter" class="anim">
+            <div class="lbl">live children</div>
+            <div class="dots"><i></i><i></i><i></i><i></i></div>
+            <div class="lbl" id="meter-n" style="margin-top:3px">0 / 4</div>
+          </div>
+
+          <div class="agentcard anim" id="root-card">
+            <div class="tag">Main agent &middot; depth 0</div>
+            <div class="name">pi - your session</div>
+            <div class="model">anthropic-vertex/claude-sonnet-5</div>
+            <div class="line" id="root-code"> </div>
+          </div>
+
+          <div class="agentcard anim" id="ctx-card">
+            <div class="tag">Parent context</div>
+            <div class="cl keep" style="margin-top:4px">user: review auth</div>
+            <div class="cl keep">assistant: plan&hellip;</div>
+            <div class="cl drop" id="ctx-drop-0">toolCall: bash(&hellip;)</div>
+            <div class="cl drop" id="ctx-drop-1">thinking: hmm&hellip;</div>
+          </div>
+          <div id="packet" class="anim">seed: sanitized ctx</div>
+
+          <div id="coord" class="anim">coordinator socket</div>
+
+          <div class="agentcard child anim" id="child-0">
+            <div class="tag">Subagent &middot; depth 1</div>
+            <div class="name">correctness</div>
+            <div class="model">gpt-5.6-terra</div>
+            <div class="status busy"><i></i><span>read src/auth.ts</span></div>
+          </div>
+          <div class="agentcard child anim" id="child-1">
+            <div class="tag">Subagent &middot; depth 1</div>
+            <div class="name">security</div>
+            <div class="model">claude-sonnet-5</div>
+            <div class="status busy"><i></i><span>grep "token"</span></div>
+            <div class="cmd danger anim" id="danger-cmd">$ rm -rf build/</div>
+          </div>
+          <div class="agentcard child anim" id="child-2">
+            <div class="tag">Subagent &middot; depth 1</div>
+            <div class="name">architecture</div>
+            <div class="model">gpt-5.6-sol</div>
+            <div class="status busy"><i></i><span>read extensions/</span></div>
+          </div>
+
+          <div class="agentcard anim" id="depth2">
+            <div class="tag">Subagent &middot; depth 2</div>
+            <div class="name">test-runner</div>
+            <div class="model">gpt-5.6-luna</div>
+          </div>
+
+          <div id="gate-bubble" class="anim">
+            <div class="who">Approval &middot; security (depth 1)</div>
+            <div class="cmd">$ rm -rf build/</div>
+            <div class="ans">&rarr; prompt in root TUI &hellip; <span class="allow" id="gate-answer" style="opacity:0">&#10003; allow once</span></div>
+          </div>
+
+          <div class="envelope anim" id="env-0">
+            <div class="head">[<b>correctness</b> | gpt-5.6-terra | <b style="color:var(--green)">completed</b> | session 0197c0de]</div>
+            <div class="body">Found 2 issues: missing null check in verify(), off-by-one in&hellip;</div>
+          </div>
+          <div class="envelope anim" id="env-1">
+            <div class="head">[<b>security</b> | claude-sonnet-5 | <b style="color:var(--green)">completed</b> | session 0197c0df]</div>
+            <div class="body">Token stored unencrypted; recommend keychain. Full threat model&hellip;</div>
+            <div class="trunc">truncated: ~1000 of ~3800 tokens &middot; full output: read 0197c0df.jsonl</div>
+          </div>
+          <div class="envelope anim" id="env-2">
+            <div class="head">[<b>architecture</b> | gpt-5.6-sol | <b style="color:var(--green)">completed</b> | session 0197c0e0]</div>
+            <div class="body">Gate/coordinator split is sound; suggest extracting spawn-env&hellip;</div>
+          </div>
+
+          <div class="chip anim" id="chip-0"><b>0197c0de</b>.jsonl<br/>meta{ rootId: self }</div>
+          <div class="chip anim" id="chip-1"><b>0197c0df</b>.jsonl<br/>meta{ rootId: self }</div>
+          <div class="chip anim" id="chip-2"><b>0197c0e0</b>.jsonl<br/>meta{ rootId: self }</div>
+        </div>
+
+        <div class="controls" id="controls">
+          <button id="btn-prev" type="button">&lsaquo; Prev</button>
+          <button id="btn-replay" type="button">&#8635; Replay</button>
+          <button id="btn-next" type="button">Next &rsaquo;</button>
+          <span id="countdown" aria-live="polite"></span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═════════ Feature grid ═════════ -->
+  <section>
+    <h2>Everything in the box</h2>
+    <p class="lead">One extension, one tool. Each capability is opt-in per call or configurable in <code>~/.pi/agent/subagent.json</code>.</p>
+
+    <div class="grid">
+      <div class="card feature">
+        <div class="fl">Modes</div>
+        <h3>Single &middot; parallel &middot; chain</h3>
+        <ul>
+          <li><b>Single</b>: one persona, one task, one result.</li>
+          <li><b>Parallel</b>: up to 8 tasks, 4 concurrent - ideal for review councils.</li>
+          <li><b>Chain</b>: sequential steps; <code>{previous}</code> pipes the prior step's full output into the next.</li>
+        </ul>
+      </div>
+
+      <div class="card feature">
+        <div class="fl">Personas</div>
+        <h3>Inline-first, files optional</h3>
+        <ul>
+          <li>Pass <code>systemPrompt</code> + <code>name</code>, <code>model</code>, <code>tools</code>, <code>thinking</code> directly in the call.</li>
+          <li>Skills can define whole expert councils in plain text - no agent files.</li>
+          <li>Named agents still supported: markdown + frontmatter in <code>~/.pi/agent/agents/</code>.</li>
+        </ul>
+      </div>
+
+      <div class="card feature">
+        <div class="fl">Context</div>
+        <h3>Fork the parent's history</h3>
+        <ul>
+          <li><code>forkContext: "none" | "all" | "N"</code> - seed children with the last N turns.</li>
+          <li>Sanitized: user messages and final answers kept; thinking, tool calls, and tool output dropped.</li>
+          <li>Compaction-aware - forks what the parent actually sees, with a size warning above ~8k tokens.</li>
+        </ul>
+      </div>
+
+      <div class="card feature">
+        <div class="fl">Results</div>
+        <h3>Envelopes with a token cap</h3>
+        <ul>
+          <li>Every result: <code>[agent | model | status | session]</code> + payload.</li>
+          <li>Capped at ~1000 tokens; precedence <b>item &gt; call &gt; config &gt; default</b>, <code>0</code> disables.</li>
+          <li>Nothing is lost: the notice points at the child's session file for the full output.</li>
+        </ul>
+      </div>
+
+      <div class="card feature">
+        <div class="fl">Nesting</div>
+        <h3>Depth 2 with a tree budget</h3>
+        <ul>
+          <li>Subagents can spawn subagents (default depth 2; set <code>maxDepth: 1</code> to opt out).</li>
+          <li>Root-scoped budget: max 4 live children across the whole tree, FIFO queue, bounded wait.</li>
+          <li>Leak-proof leases: a crashed agent's slot frees automatically on socket close.</li>
+        </ul>
+      </div>
+
+      <div class="card feature">
+        <div class="fl">Safety</div>
+        <h3>One shared permission gate</h3>
+        <ul>
+          <li>Dangerous bash (<code>rm -rf</code>, <code>git reset --hard</code>, <code>sudo</code>, &hellip;) prompts in the root TUI from any depth.</li>
+          <li>Prompts are labeled with the agent's name; concurrent requests serialize.</li>
+          <li>No UI available? Dangerous calls fail closed. Abort kills the whole process tree.</li>
+        </ul>
+      </div>
+
+      <div class="card feature">
+        <div class="fl">Sessions</div>
+        <h3>Resume anything, any time</h3>
+        <ul>
+          <li>Every run persists as <code>&lt;id&gt;.jsonl</code> + meta with <code>parent</code>/<code>rootId</code> lineage.</li>
+          <li>Pass <code>resume: "&lt;id&gt;"</code> to continue an agent with its full memory - e.g. reviewer verifies your fix.</li>
+          <li>Aborted runs hand back the session id plus the last 10 completed messages for smart recovery.</li>
+        </ul>
+      </div>
+
+      <div class="card feature">
+        <div class="fl">Steering</div>
+        <h3>Delegation policy &amp; guidance</h3>
+        <ul>
+          <li>Default policy: <b>explicit request only</b> - "more research" is not permission to spawn.</li>
+          <li>Switch to <code>"proactive"</code> or any custom policy line in <code>subagent.json</code>.</li>
+          <li>Built-in orchestration rules: self-contained tasks, no blocking delegation, disjoint write sets.</li>
+        </ul>
+      </div>
+
+      <div class="card feature">
+        <div class="fl">Visibility</div>
+        <h3>Live widget in the TUI</h3>
+        <ul>
+          <li>Per-agent rows above the editor: status, model, current tool, tokens, turns.</li>
+          <li>Nested activity shows as a <b>+N nested</b> counter on the parent's row.</li>
+          <li>Ctrl+O on the running call streams any child's output live.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═════════ Code panels ═════════ -->
+  <section>
+    <h2>Two snippets tell the whole story</h2>
+    <div class="panels">
+      <div class="card panel">
+        <div class="ph"><span>tool calls</span><span>the model writes these</span></div>
+        <pre><span class="c">// A parallel review council, inline personas:</span>
+{ <span class="k">"tasks"</span>: [
+    { <span class="k">"systemPrompt"</span>: <span class="s">"You are a security reviewer…"</span>,
+      <span class="k">"name"</span>: <span class="s">"security"</span>, <span class="k">"forkContext"</span>: <span class="s">"4"</span>,
+      <span class="k">"task"</span>: <span class="s">"Review src/auth.ts"</span> },
+    { <span class="k">"agent"</span>: <span class="s">"architecture-reviewer"</span>,
+      <span class="k">"task"</span>: <span class="s">"Review the module layout"</span> }
+] }
+
+<span class="c">// Later: the reviewer verifies your fix, with memory:</span>
+{ <span class="k">"resume"</span>: <span class="s">"0197c0df"</span>,
+  <span class="k">"task"</span>: <span class="s">"I fixed the token storage - verify."</span> }</pre>
+      </div>
+      <div class="card panel">
+        <div class="ph"><span>~/.pi/agent/subagent.json</span><span>all optional</span></div>
+        <pre>{
+  <span class="k">"delegationPolicy"</span>: <span class="s">"explicit-request-only"</span>,
+  <span class="k">"resultCapTokens"</span>: <span class="n">1000</span>,   <span class="c">// 0 = no cap</span>
+  <span class="k">"maxDepth"</span>: <span class="n">2</span>,            <span class="c">// 1 = no nesting</span>
+  <span class="k">"maxLiveChildren"</span>: <span class="n">4</span>,     <span class="c">// tree-wide</span>
+  <span class="k">"budgetAcquireTimeoutMs"</span>: <span class="n">120000</span>
+}</pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═════════ Architecture ═════════ -->
+  <section>
+    <h2>How it works underneath</h2>
+    <div class="card arch">
+      <ol>
+        <li><b>Real processes, not threads.</b> Each subagent is <code>pi --mode json -p --session &lt;file&gt;</code>; the JSONL event stream drives rendering, the widget, and usage accounting. A crashing child can never take down your session.</li>
+        <li><b>One coordinator socket per tree.</b> The root owns a Unix socket that carries approval proxying, the live-children budget (hold-open leases - release is the OS closing the connection), and nested status counts.</li>
+        <li><b>Env contract for nesting.</b> <code>PI_SUBAGENT_DEPTH</code>, <code>ROOT_ID</code>, and the frozen tree policy travel via environment - children can't raise their own budget. <code>PI_SUBAGENT_INHERITED_TOOLS</code> lets MCP bridges re-activate the parent's selection.</li>
+        <li><b>Sessions are the source of truth.</b> <code>~/.pi/agent/subagent-sessions/</code> holds every child's full transcript and lineage metadata - resumable across your own sessions, forever.</li>
+      </ol>
+    </div>
+  </section>
+
+  <footer class="page">
+    <a href="https://github.com/nilskluewer/pi-subagent">github.com/nilskluewer/pi-subagent</a>
+    <a href="https://www.npmjs.com/package/@nilskluewer/pi-subagent">npm: @nilskluewer/pi-subagent</a>
+    <span>MIT license</span>
+    <span>macOS verified &middot; Windows kill-cascade untested</span>
+    <span>design study: how OpenAI Codex does multi-agent &rarr; docs/codex-subagent-comparison.md</span>
+  </footer>
+</div>
+
+<script>
+(function () {
+  "use strict";
+  var NSTEPS = 6, RESTART_DELAY_S = 5;
+  var reduced = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  if (reduced || !window.gsap) {
+    document.body.classList.add("static");
+    var steps = document.querySelectorAll("#steps > li");
+    for (var i = 0; i < steps.length; i++) steps[i].classList.add("done");
+    var rc = document.getElementById("root-code");
+    if (rc) rc.textContent = 'subagent({ tasks: 3 personas,\n  forkContext: "all" })';
+    return;
+  }
+
+  var $ = function (id) { return document.getElementById(id); };
+  var stepsEl = Array.prototype.slice.call(document.querySelectorAll("#steps > li"));
+  var meterDots = Array.prototype.slice.call(document.querySelectorAll("#meter .dots i"));
+  var countdownEl = $("countdown"), countdownTimer = null;
+  var step = 0;
+
+  function renderSteps() {
+    stepsEl.forEach(function (li, i) {
+      li.classList.toggle("active", i === step);
+      li.classList.toggle("done", i < step);
+    });
+    $("btn-prev").disabled = step === 0;
+    $("btn-next").disabled = step === NSTEPS - 1;
+  }
+
+  function setMeter(n) {
+    meterDots.forEach(function (d, i) { d.classList.toggle("on", i < n); });
+    $("meter-n").textContent = n + " / 4";
+  }
+
+  function clearCountdown() {
+    if (countdownTimer !== null) { clearInterval(countdownTimer); countdownTimer = null; }
+    countdownEl.classList.remove("show");
+    countdownEl.textContent = "";
+  }
+  function startCountdown() {
+    clearCountdown();
+    var left = RESTART_DELAY_S;
+    countdownEl.textContent = "Replay in " + left + "s";
+    countdownEl.classList.add("show");
+    countdownTimer = setInterval(function () {
+      left -= 1;
+      if (left <= 0) { clearCountdown(); resetTransients(); step = 0; renderSteps(); tl.restart(); }
+      else { countdownEl.textContent = "Replay in " + left + "s"; }
+    }, 1000);
+  }
+
+  function resetTransients() {
+    var st = document.querySelector("#child-1 .status");
+    st.classList.add("busy"); st.classList.remove("resumed");
+    st.querySelector("span").textContent = 'grep "token"';
+    $("ctx-drop-0").classList.remove("struck");
+    $("ctx-drop-1").classList.remove("struck");
+  }
+
+  function drawStroke(tl, sel, at, dur) {
+    var node = $(sel);
+    var len; try { len = node.getTotalLength(); } catch (e) { len = 600; }
+    node.style.strokeDasharray = len;
+    node.style.strokeDashoffset = len;
+    tl.set(node, { opacity: 1 }, at);
+    tl.to(node.style, { strokeDashoffset: 0, duration: dur || 0.5, ease: "power2.inOut" }, at);
+  }
+
+  var CODE = 'subagent({ tasks: 3 personas,\n  forkContext: "all" })';
+  function typeCode(tl, at) {
+    var node = $("root-code"), proxy = { p: 0 };
+    tl.to(proxy, {
+      p: CODE.length, duration: 0.9, ease: "power1.inOut",
+      onUpdate: function () { node.textContent = CODE.slice(0, Math.round(proxy.p)) || " "; }
+    }, at);
+  }
+
+  var tl = gsap.timeline();
+  function stepAt(n, at) {
+    tl.addLabel("step" + n, at);
+    tl.call(function () { step = n; renderSteps(); }, null, "step" + n);
+  }
+
+  // ── STEP 1 · Delegate ──
+  tl.addLabel("delegate");
+  stepAt(0, "delegate");
+  tl.set(["#child-0 .status i", "#child-1 .status i", "#child-2 .status i"], { clearProps: "all" }, "delegate");
+  tl.call(function () { setMeter(0); }, null, "delegate");
+  tl.fromTo("#root-card", { opacity: 0, y: -14 }, { opacity: 1, y: 0, duration: 0.5, ease: "power2.out" }, "delegate");
+  typeCode(tl, "delegate+=0.5");
+  tl.to({}, { duration: 0.6 });
+
+  // ── STEP 2 · Fork ──
+  tl.addLabel("fork", "delegate+=2.1");
+  stepAt(1, "fork");
+  tl.fromTo("#ctx-card", { opacity: 0, x: -10 }, { opacity: 1, x: 0, duration: 0.45, ease: "power2.out" }, "fork");
+  tl.call(function () { $("ctx-drop-0").classList.add("struck"); }, null, "fork+=0.7");
+  tl.call(function () { $("ctx-drop-1").classList.add("struck"); }, null, "fork+=0.95");
+  tl.fromTo("#packet", { opacity: 0, x: 0, y: 0 }, { opacity: 1, duration: 0.3 }, "fork+=1.2");
+  tl.to("#packet", { x: 105, y: 82, duration: 0.8, ease: "power2.inOut" }, "fork+=1.5");
+  tl.to("#packet", { opacity: 0, duration: 0.3 }, "fork+=2.3");
+
+  // ── STEP 3 · Spawn ──
+  tl.addLabel("spawn", "fork+=2.8");
+  stepAt(2, "spawn");
+  tl.fromTo("#coord", { opacity: 0, scale: 0.9 }, { opacity: 1, scale: 1, duration: 0.4, ease: "back.out(2)" }, "spawn");
+  drawStroke(tl, "w-root", "spawn+=0.1", 0.3);
+  ["w-c0", "w-c1", "w-c2"].forEach(function (w, i) { drawStroke(tl, w, "spawn+=" + (0.4 + i * 0.25), 0.35); });
+  ["child-0", "child-1", "child-2"].forEach(function (c, i) {
+    tl.fromTo("#" + c, { opacity: 0, y: 14, scale: 0.96 }, { opacity: 1, y: 0, scale: 1, duration: 0.45, ease: "power2.out" }, "spawn+=" + (0.6 + i * 0.3));
+    tl.call(function () { setMeter(i + 1); }, null, "spawn+=" + (0.7 + i * 0.3));
+  });
+  tl.fromTo("#meter", { opacity: 0 }, { opacity: 1, duration: 0.4 }, "spawn+=0.4");
+  drawStroke(tl, "w-d2", "spawn+=1.8", 0.3);
+  tl.fromTo("#depth2", { opacity: 0, y: 10 }, { opacity: 1, y: 0, duration: 0.4, ease: "power2.out" }, "spawn+=2.0");
+  tl.call(function () { setMeter(4); }, null, "spawn+=2.1");
+
+  // ── STEP 4 · Gate ──
+  tl.addLabel("gate", "spawn+=3.1");
+  stepAt(3, "gate");
+  tl.fromTo("#danger-cmd", { opacity: 0 }, { opacity: 1, duration: 0.3 }, "gate");
+  drawStroke(tl, "w-gate", "gate+=0.35", 0.6);
+  tl.fromTo("#gate-bubble", { opacity: 0, y: 8, scale: 0.97 }, { opacity: 1, y: 0, scale: 1, duration: 0.4, ease: "power2.out" }, "gate+=0.9");
+  tl.to("#gate-answer", { opacity: 1, duration: 0.3 }, "gate+=1.8");
+  tl.to("#gate-bubble", { opacity: 0, y: -6, duration: 0.4 }, "gate+=2.8");
+  tl.to("#w-gate", { opacity: 0, duration: 0.4 }, "gate+=2.8");
+  tl.to("#danger-cmd", { color: "#1e7a3c", duration: 0.3 }, "gate+=2.8");
+
+  // ── STEP 5 · Report ──
+  tl.addLabel("report", "gate+=3.5");
+  stepAt(4, "report");
+  tl.to("#depth2", { opacity: 0, y: -16, duration: 0.5, ease: "power2.in" }, "report");
+  tl.to("#w-d2", { opacity: 0, duration: 0.3 }, "report");
+  tl.call(function () { setMeter(3); }, null, "report+=0.5");
+  ["child-0", "child-1", "child-2"].forEach(function (c, i) {
+    tl.to("#" + c + " .status i", { backgroundColor: "#1e7a3c", duration: 0.25 }, "report+=" + (0.4 + i * 0.2));
+  });
+  ["env-0", "env-1", "env-2"].forEach(function (e, i) {
+    tl.fromTo("#" + e, { opacity: 0, y: 12 }, { opacity: 1, y: 0, duration: 0.5, ease: "power2.out" }, "report+=" + (0.8 + i * 0.4));
+  });
+  tl.call(function () { setMeter(0); }, null, "report+=2.2");
+  tl.to({}, { duration: 0.6 });
+
+  // ── STEP 6 · Resume ──
+  tl.addLabel("resume", "report+=3.2");
+  stepAt(5, "resume");
+  tl.to(["#env-0", "#env-2"], { opacity: 0.35, duration: 0.5 }, "resume");
+  ["chip-0", "chip-1", "chip-2"].forEach(function (c, i) {
+    tl.fromTo("#" + c, { opacity: 0, y: 8 }, { opacity: 1, y: 0, duration: 0.4, ease: "power2.out" }, "resume+=" + (0.2 + i * 0.2));
+  });
+  drawStroke(tl, "w-resume", "resume+=1.0", 0.6);
+  tl.fromTo("#w-resume-tip", { opacity: 0 }, { opacity: 1, duration: 0.2 }, "resume+=1.55");
+  tl.call(function () {
+    var st = document.querySelector("#child-1 .status");
+    st.classList.remove("busy"); st.classList.add("resumed");
+    st.querySelector("span").textContent = "resumed · turn 2";
+  }, null, "resume+=1.7");
+  tl.fromTo("#child-1", { boxShadow: "0 0 0 0 rgba(47,111,208,0)" },
+    { boxShadow: "0 0 0 4px rgba(47,111,208,.18)", duration: 0.4, yoyo: true, repeat: 1 }, "resume+=1.7");
+  tl.to({}, { duration: 1.0 });
+  tl.eventCallback("onComplete", startCountdown);
+
+  // ── Controls ──
+  $("btn-replay").addEventListener("click", function () {
+    clearCountdown(); resetTransients(); step = 0; renderSteps(); tl.restart();
+  });
+  function seek(n) {
+    clearCountdown();
+    var clamped = Math.max(0, Math.min(NSTEPS - 1, n));
+    step = clamped; renderSteps();
+    tl.pause();
+    tl.tweenTo("step" + clamped);
+  }
+  $("btn-prev").addEventListener("click", function () { seek(step - 1); });
+  $("btn-next").addEventListener("click", function () { seek(step + 1); });
+
+  renderSteps();
+})();
+</script>
+</body>
+</html>
