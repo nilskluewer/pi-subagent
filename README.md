@@ -1,5 +1,9 @@
 # @nilskluewer/pi-subagent
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/nilskluewer/pi-subagent/main/docs/assets/agent-tree.png" alt="A delegation run: main agent, coordinator socket, three subagents, capped result envelopes, and persisted session files" width="560" />
+</p>
+
 One subagent extension for Pi that covers exactly what a multi-agent workflow needs:
 
 - **`subagent` tool** - delegate tasks to isolated `pi` child processes with single,
@@ -48,8 +52,21 @@ pi install git:github.com/nilskluewer/pi-subagent
 From a local checkout:
 
 ```bash
-pi install /Users/A200048/GitHub/pi-subagent
+pi install /path/to/pi-subagent
 ```
+
+## How a delegation runs
+
+Six stations, from the first tool call to a resumable session:
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/nilskluewer/pi-subagent/main/docs/assets/walkthrough.png" alt="Six-step walkthrough: Delegate, Fork, Spawn, Gate, Report, Resume" width="820" />
+</p>
+
+There is an animated version of this walkthrough: open
+[`docs/one-pager.html`](https://github.com/nilskluewer/pi-subagent/blob/main/docs/one-pager.html)
+locally (`open docs/one-pager.html`) for the step-through animation, feature grid,
+and config reference on a single page.
 
 ## Tool usage
 
