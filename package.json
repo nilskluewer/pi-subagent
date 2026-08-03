@@ -1,7 +1,7 @@
 {
   "name": "@nilskluewer/pi-subagent",
-  "version": "0.5.0",
-  "description": "Subagent tool for Pi: inline or named agent personas, parallel/chain execution, resumable sessions, live widget, and a shared permission gate for main agent and subagents.",
+  "version": "0.6.0",
+  "description": "Subagent tool for Pi: inline or named agent personas, parallel/chain execution, resumable sessions, live widget, and a parent-side approval coordinator for the permission gate extension.",
   "type": "module",
   "keywords": [
     "pi-package",
@@ -37,6 +37,7 @@
     ]
   },
   "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*"

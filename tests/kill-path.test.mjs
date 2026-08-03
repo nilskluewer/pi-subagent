@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createAbortKillController, selectKillStrategy, shouldDetachChild } from "../extensions/subagent/subagent-tool.ts";
+import {
+  buildPiArguments,
+  classifyChildTermination,
+  createAbortKillController,
+  selectKillStrategy,
+  shouldDetachChild,
+} from "../extensions/subagent/subagent-tool.ts";
 
 class FakeSignal {
   aborted = false;
@@ -32,6 +38,54 @@ test("kill strategy uses a process group only for detached POSIX children", () =
   assert.equal(selectKillStrategy("darwin", true), "process-group");
   assert.equal(selectKillStrategy("linux", false), "direct");
   assert.equal(selectKillStrategy("win32", false), "windows-taskkill");
+});
+
+test("subagent task text is passed through an @file argument", () => {
+  const args = buildPiArguments(
+    {
+      sessionFile: "/tmp/worker.jsonl",
+      model: "github-copilot/gpt-5.6-luna",
+      tools: ["read", "write"],
+      thinking: "high",
+    },
+    "/tmp/task-prompt.md",
+    "/tmp/system-prompt.md",
+  );
+
+  assert.deepEqual(args, [
+    "--mode",
+    "json",
+    "-p",
+    "--session",
+    "/tmp/worker.jsonl",
+    "--model",
+    "github-copilot/gpt-5.6-luna",
+    "--tools",
+    "read,write",
+    "--thinking",
+    "high",
+    "--append-system-prompt",
+    "/tmp/system-prompt.md",
+    "@/tmp/task-prompt.md",
+  ]);
+  assert.equal(args.some((arg) => arg.includes("Task:")), false);
+});
+
+test("signal termination is reported as failure instead of success", () => {
+  assert.deepEqual(
+    classifyChildTermination({ code: null, signal: "SIGKILL" }, false),
+    {
+      exitCode: 1,
+      stopReason: "error",
+      errorMessage: "Child process terminated by signal SIGKILL.",
+      terminationSignal: "SIGKILL",
+    },
+  );
+
+  assert.deepEqual(
+    classifyChildTermination({ code: null, signal: "SIGTERM" }, true),
+    { exitCode: 1, stopReason: "aborted" },
+  );
 });
 
 test("abort controller removes abort listener and clears escalation timer on close", () => {

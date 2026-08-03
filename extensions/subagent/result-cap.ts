@@ -42,8 +42,9 @@ export function formatEnvelope(
 	opts: { maxTokens: number },
 ): string {
 	const model = result.model ?? "default";
+	const thinking = result.thinking ? ` | thinking: ${result.thinking}` : "";
 	const session = result.sessionId ?? "unavailable";
-	const header = `[agent: ${result.agent} | model: ${model} | status: ${resultStatus(result)} | session: ${session}]`;
+	const header = `[agent: ${result.agent} | model: ${model}${thinking} | status: ${resultStatus(result)} | session: ${session}]`;
 	const parts = [header, capped.text || "(no output)"];
 
 	if (capped.truncated) {

@@ -47,7 +47,20 @@ import {
 } from "./context-fork.ts";
 import type { ForkContext } from "./context-fork.ts";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
-import { DEFAULT_BUDGET_ACQUIRE_TIMEOUT_MS, DEFAULT_MAX_DEPTH, DEFAULT_MAX_LIVE_CHILDREN, OPERATIONAL_GUIDELINES, TREE_POLICY_ENV, buildDelegationPolicyLine, loadSubagentConfig, treePolicyFromEnv } from "./config.ts";
+import {
+	canonicalModelReference,
+	DEFAULT_BUDGET_ACQUIRE_TIMEOUT_MS,
+	DEFAULT_MAX_DEPTH,
+	DEFAULT_MAX_LIVE_CHILDREN,
+	OPERATIONAL_GUIDELINES,
+	TREE_POLICY_ENV,
+	buildDelegationPolicyLine,
+	loadSubagentConfig,
+	type ModelReferenceRegistry,
+	type SubagentConfig,
+	type SubagentThinkingLevel,
+	treePolicyFromEnv,
+} from "./config.ts";
 import { inheritedToolsEnv } from "./inherited-tools.ts";
 import { capText, formatEnvelope, resolveResultCap } from "./result-cap.ts";
 import { type ApprovalServer, startApprovalServer } from "./approval-server.ts";
@@ -171,6 +184,11 @@ function formatToolCall(
 
 const plainFg = (_color: any, text: string) => text;
 
+function resultSettingsTag(result: Pick<SingleResult, "model" | "thinking">): string {
+	const model = result.model ?? "default";
+	return result.thinking ? `${model}, thinking:${result.thinking}` : model;
+}
+
 export interface UsageStats {
 	input: number;
 	output: number;
@@ -194,8 +212,10 @@ export interface SingleResult {
 	stderr: string;
 	usage: UsageStats;
 	model?: string;
+	thinking?: string;
 	stopReason?: string;
 	errorMessage?: string;
+	terminationSignal?: NodeJS.Signals;
 	step?: number;
 	forkWarning?: string;
 	forkedFrom?: string;
@@ -243,6 +263,21 @@ interface SessionMeta {
 	rootId?: string;
 }
 
+export interface SubagentResolutionDefaults {
+	defaultModel?: string;
+	defaultThinkingLevel?: SubagentThinkingLevel;
+}
+
+export function resolveSubagentDefaults(
+	config: Pick<SubagentConfig, "defaultModel" | "defaultThinkingLevel">,
+	registry: ModelReferenceRegistry,
+): SubagentResolutionDefaults {
+	return {
+		defaultModel: config.defaultModel ? canonicalModelReference(config.defaultModel, registry) : undefined,
+		defaultThinkingLevel: config.defaultThinkingLevel,
+	};
+}
+
 interface TaskItemInput {
 	agent?: string;
 	systemPrompt?: string;
@@ -269,6 +304,7 @@ export function resolveSpec(
 	item: TaskItemInput,
 	agents: AgentConfig[],
 	index: number,
+	defaults: SubagentResolutionDefaults = {},
 ): { spec: AgentSpec } | { error: string } {
 	const forkContext = parseForkContext(item.forkContext);
 	if ("error" in forkContext) return { error: forkContext.error };
@@ -299,6 +335,11 @@ export function resolveSpec(
 			spec: {
 				name: meta.name,
 				systemPrompt: meta.systemPrompt ?? "",
+				// A resumed Pi session restores its effective model and thinking level
+				// from the child JSONL. Do not inject current subagent defaults when
+				// older metadata omits either field, because --model/--thinking would
+				// override Pi's session restoration. Explicit resume-call overrides and
+				// recorded metadata remain authoritative.
 				model: item.model ?? meta.model,
 				tools: parseToolsList(item.tools) ?? meta.tools,
 				thinking: item.thinking ?? meta.thinking,
@@ -326,9 +367,9 @@ export function resolveSpec(
 			spec: {
 				name: agent.name,
 				systemPrompt: agent.systemPrompt,
-				model: item.model ?? agent.model,
+				model: item.model ?? agent.model ?? defaults.defaultModel,
 				tools: parseToolsList(item.tools) ?? agent.tools,
-				thinking: item.thinking ?? agent.thinking,
+				thinking: item.thinking ?? agent.thinking ?? defaults.defaultThinkingLevel,
 				source: agent.source,
 				sessionId,
 				sessionFile,
@@ -342,9 +383,9 @@ export function resolveSpec(
 		spec: {
 			name: item.name?.trim() || `agent-${index + 1}`,
 			systemPrompt: item.systemPrompt ?? "",
-			model: item.model,
+			model: item.model ?? defaults.defaultModel,
 			tools: parseToolsList(item.tools),
-			thinking: item.thinking,
+			thinking: item.thinking ?? defaults.defaultThinkingLevel,
 			source: "inline",
 			sessionId,
 			sessionFile,
@@ -498,6 +539,40 @@ async function writePromptToTempFile(agentName: string, prompt: string): Promise
 		await fs.promises.writeFile(filePath, prompt, { encoding: "utf-8", mode: 0o600 });
 	});
 	return { dir: tmpDir, filePath };
+}
+
+function cleanupTempPrompt(filePath: string | null, dir: string | null): void {
+	if (filePath)
+		try {
+			fs.unlinkSync(filePath);
+		} catch {
+			/* ignore */
+		}
+	if (dir)
+		try {
+			fs.rmdirSync(dir);
+		} catch {
+			/* ignore */
+		}
+}
+
+export function buildPiArguments(
+	spec: Pick<AgentSpec, "sessionFile" | "model" | "tools" | "thinking">,
+	taskPromptPath: string,
+	systemPromptPath?: string,
+): string[] {
+	const args: string[] = ["--mode", "json", "-p", "--session", spec.sessionFile];
+	if (spec.model) args.push("--model", spec.model);
+	if (spec.tools && spec.tools.length > 0) args.push("--tools", spec.tools.join(","));
+	if (spec.thinking) args.push("--thinking", spec.thinking);
+	if (systemPromptPath) args.push("--append-system-prompt", systemPromptPath);
+
+	// Keep arbitrary task text out of argv. Endpoint security tooling on macOS scans
+	// command-line arguments as paths and can terminate the child when the task is
+	// long enough to look like an invalid filename. Pi expands @file arguments into
+	// the initial user message.
+	args.push(`@${taskPromptPath}`);
+	return args;
 }
 
 function getPiInvocation(args: string[]): { command: string; args: string[] } {
@@ -720,6 +795,43 @@ export function createAbortKillController(
 	};
 }
 
+export interface ChildTermination {
+	code: number | null;
+	signal: NodeJS.Signals | null;
+}
+
+export interface ChildTerminationOutcome {
+	exitCode: number;
+	stopReason?: "error" | "aborted";
+	errorMessage?: string;
+	terminationSignal?: NodeJS.Signals;
+}
+
+export function classifyChildTermination(
+	termination: ChildTermination,
+	wasAborted: boolean,
+): ChildTerminationOutcome {
+	if (wasAborted) {
+		return { exitCode: termination.code || 1, stopReason: "aborted" };
+	}
+	if (termination.signal) {
+		return {
+			exitCode: termination.code ?? 1,
+			stopReason: "error",
+			errorMessage: `Child process terminated by signal ${termination.signal}.`,
+			terminationSignal: termination.signal,
+		};
+	}
+	if (termination.code === null) {
+		return {
+			exitCode: 1,
+			stopReason: "error",
+			errorMessage: "Child process ended without an exit code or signal.",
+		};
+	}
+	return { exitCode: termination.code };
+}
+
 export async function runSingleAgent(
 	defaultCwd: string,
 	spec: AgentSpec,
@@ -736,13 +848,10 @@ export async function runSingleAgent(
 	currentDepth: number,
 	widget: WidgetTracker,
 ): Promise<SingleResult> {
-	const args: string[] = ["--mode", "json", "-p", "--session", spec.sessionFile];
-	if (spec.model) args.push("--model", spec.model);
-	if (spec.tools && spec.tools.length > 0) args.push("--tools", spec.tools.join(","));
-	if (spec.thinking) args.push("--thinking", spec.thinking);
-
 	let tmpPromptDir: string | null = null;
 	let tmpPromptPath: string | null = null;
+	let taskPromptDir: string | null = null;
+	let taskPromptPath: string | null = null;
 	let releaseSlot: (() => void) | undefined;
 
 	const currentResult: SingleResult = {
@@ -756,6 +865,7 @@ export async function runSingleAgent(
 		stderr: "",
 		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
 		model: spec.model,
+		thinking: spec.thinking,
 		step,
 		forkWarning: spec.forkWarning,
 		forkedFrom: spec.forkedFrom,
@@ -797,13 +907,14 @@ export async function runSingleAgent(
 			const tmp = await writePromptToTempFile(spec.name, spec.systemPrompt);
 			tmpPromptDir = tmp.dir;
 			tmpPromptPath = tmp.filePath;
-			args.push("--append-system-prompt", tmpPromptPath);
 		}
-
-		args.push(`Task: ${task}`);
+		const taskPrompt = await writePromptToTempFile(spec.name, `Task: ${task}`);
+		taskPromptDir = taskPrompt.dir;
+		taskPromptPath = taskPrompt.filePath;
+		const args = buildPiArguments(spec, taskPrompt.filePath, tmpPromptPath ?? undefined);
 		let abortController: AbortKillController | undefined;
 
-		const exitCode = await new Promise<number>((resolve) => {
+		const termination = await new Promise<ChildTermination>((resolve) => {
 			const invocation = getPiInvocation(args);
 			const detached = shouldDetachChild(process.platform, currentDepth);
 			const killStrategy = selectKillStrategy(process.platform, detached);
@@ -888,40 +999,34 @@ export async function runSingleAgent(
 				currentResult.stderr += data.toString();
 			});
 
-			proc.on("close", (code) => {
+			proc.on("close", (code, signal) => {
 				abortController?.onClose();
 				if (buffer.trim()) processLine(buffer);
-				resolve(code ?? 0);
+				resolve({ code, signal });
 			});
 
-			proc.on("error", () => {
+			proc.on("error", (error) => {
 				abortController?.onClose();
-				resolve(1);
+				currentResult.stderr += `Child process error: ${error.message}\n`;
+				resolve({ code: 1, signal: null });
 			});
 
 			abortController = createAbortKillController(signal, (signalName) => killChild(proc, signalName, killStrategy));
 		});
 
-		currentResult.exitCode = abortController?.wasAborted() ? exitCode || 1 : exitCode;
-		if (abortController?.wasAborted()) currentResult.stopReason = "aborted";
+		const outcome = classifyChildTermination(termination, abortController?.wasAborted() ?? false);
+		currentResult.exitCode = outcome.exitCode;
+		if (outcome.stopReason) currentResult.stopReason = outcome.stopReason;
+		if (outcome.errorMessage) currentResult.errorMessage = outcome.errorMessage;
+		if (outcome.terminationSignal) currentResult.terminationSignal = outcome.terminationSignal;
 		widget.finish(spec.sessionId, !isFailedResult(currentResult));
 		return currentResult;
 	} catch (error) {
 		widget.finish(spec.sessionId, false);
 		throw error;
 	} finally {
-		if (tmpPromptPath)
-			try {
-				fs.unlinkSync(tmpPromptPath);
-			} catch {
-				/* ignore */
-			}
-		if (tmpPromptDir)
-			try {
-				fs.rmdirSync(tmpPromptDir);
-			} catch {
-				/* ignore */
-			}
+		cleanupTempPrompt(taskPromptPath, taskPromptDir);
+		cleanupTempPrompt(tmpPromptPath, tmpPromptDir);
 		releaseSlot?.();
 	}
 }
@@ -933,8 +1038,8 @@ const agentSelectionFields = {
 	model: Type.Optional(Type.String({ description: "Model override (provider/model-id)" })),
 	tools: Type.Optional(Type.String({ description: "Comma-separated tool allowlist for the agent (e.g. \"read,grep,find,ls\")" })),
 	thinking: Type.Optional(
-		StringEnum(["off", "minimal", "low", "medium", "high", "xhigh"] as const, {
-			description: "Thinking level for the agent. Default: inherits the global default (currently \"medium\").",
+		StringEnum(["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const, {
+			description: "Thinking level for the agent. Default: inherits the configured subagent default, then Pi's child-process default.",
 		}),
 	),
 	resume: Type.Optional(Type.String({ description: "Session id of a previous subagent run to continue with full context" })),
@@ -1001,8 +1106,15 @@ export function registerSubagentTool(pi: ExtensionAPI) {
 		budgetAcquireTimeoutMs: DEFAULT_BUDGET_ACQUIRE_TIMEOUT_MS,
 	};
 	const fileConfig = loadSubagentConfig();
+	// Keep session-scoped policy here, but deliberately do not capture
+	// defaultModel/defaultThinkingLevel. Those two values are command-controlled
+	// and are loaded inside execute() for every future call.
 	const config = {
-		...fileConfig,
+		delegationPolicy: fileConfig.delegationPolicy,
+		resultCapTokens: fileConfig.resultCapTokens,
+		maxDepth: fileConfig.maxDepth,
+		maxLiveChildren: fileConfig.maxLiveChildren,
+		budgetAcquireTimeoutMs: fileConfig.budgetAcquireTimeoutMs,
 		...(registrationDepth > 0 ? treePolicyFromEnv(process.env, defaultTreePolicy) : {}),
 	};
 	pi.registerTool({
@@ -1021,10 +1133,17 @@ export function registerSubagentTool(pi: ExtensionAPI) {
 
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			const agentScope: AgentScope = params.agentScope ?? "user";
-			const capFor = (item: { resultCapTokens?: number }) =>
-				resolveResultCap(item.resultCapTokens, params.resultCapTokens, config.resultCapTokens);
 			const discovery = discoverAgents(ctx.cwd, agentScope);
 			const agents = discovery.agents;
+			// Read these two command-controlled values for every tool call. This keeps
+			// /subagent-defaults effective immediately without freezing them at
+			// session_start, while the registry lookup prevents hand-edited unknown
+			// models from reaching a child process.
+			const liveConfig = loadSubagentConfig();
+			const resolutionDefaults = resolveSubagentDefaults(liveConfig, ctx.modelRegistry);
+			const resolve = (item: TaskItemInput, index: number) => resolveSpec(item, agents, index, resolutionDefaults);
+			const capFor = (item: { resultCapTokens?: number }) =>
+				resolveResultCap(item.resultCapTokens, params.resultCapTokens, config.resultCapTokens);
 			const confirmProjectAgents = params.confirmProjectAgents ?? true;
 
 			const hasChain = (params.chain?.length ?? 0) > 0;
@@ -1122,7 +1241,7 @@ export function registerSubagentTool(pi: ExtensionAPI) {
 						const step = params.chain[i];
 						const taskWithContext = step.task.replace(/\{previous\}/g, previousOutput);
 
-						const resolved = resolveSpec(step, agents, i);
+						const resolved = resolve(step, i);
 						if ("error" in resolved) {
 							const result = errorResult(displayName(step), taskWithContext, resolved.error, i + 1);
 							results.push(result);
@@ -1202,7 +1321,7 @@ export function registerSubagentTool(pi: ExtensionAPI) {
 						};
 
 					// Resolve all specs up front so schema errors surface before anything spawns
-					const resolvedItems = params.tasks.map((t, i) => ({ item: t, resolved: resolveSpec(t, agents, i) }));
+					const resolvedItems = params.tasks.map((t, i) => ({ item: t, resolved: resolve(t, i) }));
 					const resolveErrors = resolvedItems
 						.map(({ item, resolved }, i) =>
 							"error" in resolved ? `Task ${i + 1} (${displayName(item)}): ${resolved.error}` : null,
@@ -1238,6 +1357,8 @@ export function registerSubagentTool(pi: ExtensionAPI) {
 							messages: [],
 							stderr: "",
 							usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+							model: spec.model,
+							thinking: spec.thinking,
 							forkWarning: spec.forkWarning,
 							forkedFrom: spec.forkedFrom,
 							parent: spec.parent,
@@ -1299,7 +1420,7 @@ export function registerSubagentTool(pi: ExtensionAPI) {
 				}
 
 				if (hasSingle && params.task) {
-					const resolved = resolveSpec(params, agents, 0);
+					const resolved = resolve(params, 0);
 					if ("error" in resolved) {
 						return {
 							content: [{ type: "text", text: resolved.error }],
@@ -1437,7 +1558,7 @@ export function registerSubagentTool(pi: ExtensionAPI) {
 
 				if (expanded) {
 					const container = new Container();
-					let header = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource}) [${r.model ?? "default"}]`)}`;
+					let header = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource}) [${resultSettingsTag(r)}]`)}`;
 					if (isError && r.stopReason) header += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
 					container.addChild(new Text(header, 0, 0));
 					if (isError && r.errorMessage)
@@ -1475,7 +1596,7 @@ export function registerSubagentTool(pi: ExtensionAPI) {
 					return container;
 				}
 
-				let text = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource}) [${r.model ?? "default"}]`)}`;
+				let text = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource}) [${resultSettingsTag(r)}]`)}`;
 				if (isError && r.stopReason) text += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
 				if (isError && r.errorMessage) text += `\n${theme.fg("error", `Error: ${r.errorMessage}`)}`;
 				else if (displayItems.length === 0) text += `\n${theme.fg("muted", "(no output)")}`;
@@ -1527,7 +1648,7 @@ export function registerSubagentTool(pi: ExtensionAPI) {
 						container.addChild(new Spacer(1));
 						container.addChild(
 							new Text(
-								`${theme.fg("muted", `─── Step ${r.step}: `) + theme.fg("accent", r.agent)} ${theme.fg("dim", `[${r.model ?? "default"}]`)} ${rIcon}`,
+								`${theme.fg("muted", `─── Step ${r.step}: `) + theme.fg("accent", r.agent)} ${theme.fg("dim", `[${resultSettingsTag(r)}]`)} ${rIcon}`,
 								0,
 								0,
 							),
@@ -1575,7 +1696,7 @@ export function registerSubagentTool(pi: ExtensionAPI) {
 				for (const r of details.results) {
 					const rIcon = r.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
 					const displayItems = getDisplayItems(r.messages);
-					text += `\n\n${theme.fg("muted", `─── Step ${r.step}: `)}${theme.fg("accent", r.agent)} ${theme.fg("dim", `[${r.model ?? "default"}]`)} ${rIcon}`;
+					text += `\n\n${theme.fg("muted", `─── Step ${r.step}: `)}${theme.fg("accent", r.agent)} ${theme.fg("dim", `[${resultSettingsTag(r)}]`)} ${rIcon}`;
 					if (r.forkedFrom) text += `\n${theme.fg("dim", `forked from: ${r.forkedFrom}`)}`;
 					if (displayItems.length === 0) text += `\n${theme.fg("muted", "(no output)")}`;
 					else text += `\n${renderDisplayItems(displayItems, 5)}`;
@@ -1618,7 +1739,7 @@ export function registerSubagentTool(pi: ExtensionAPI) {
 						container.addChild(new Spacer(1));
 						container.addChild(
 							new Text(
-								`${theme.fg("muted", "─── ") + theme.fg("accent", r.agent)} ${theme.fg("dim", `[${r.model ?? "default"}]`)} ${rIcon}`,
+								`${theme.fg("muted", "─── ") + theme.fg("accent", r.agent)} ${theme.fg("dim", `[${resultSettingsTag(r)}]`)} ${rIcon}`,
 								0,
 								0,
 							),
@@ -1668,7 +1789,7 @@ export function registerSubagentTool(pi: ExtensionAPI) {
 								? theme.fg("error", "✗")
 								: theme.fg("success", "✓");
 					const displayItems = getDisplayItems(r.messages);
-					text += `\n\n${theme.fg("muted", "─── ")}${theme.fg("accent", r.agent)} ${theme.fg("dim", `[${r.model ?? "default"}]`)} ${rIcon}`;
+					text += `\n\n${theme.fg("muted", "─── ")}${theme.fg("accent", r.agent)} ${theme.fg("dim", `[${resultSettingsTag(r)}]`)} ${rIcon}`;
 					if (r.forkedFrom) text += `\n${theme.fg("dim", `forked from: ${r.forkedFrom}`)}`;
 					if (displayItems.length === 0)
 						text += `\n${theme.fg("muted", r.exitCode === -1 ? "(running...)" : "(no output)")}`;

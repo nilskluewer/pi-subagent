@@ -9,7 +9,7 @@ import * as fs from "node:fs";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
-import { type ApprovalRequest, summarizeInput } from "./gate.ts";
+import { type ApprovalRequest, summarizeInput } from "./approval-protocol.ts";
 
 interface ApprovalUi {
 	select?: (title: string, options: string[]) => Promise<string | undefined>;

@@ -27,15 +27,17 @@ One subagent extension for Pi that covers exactly what a multi-agent workflow ne
   more level of subagents (`maxDepth: 2`). A root-scoped coordinator enforces a default
   tree-wide limit of 4 live child processes. Set `maxDepth: 1` to restore the old hard
   grandchild ban.
-- **Shared permission gate** - the same gate protects the main agent and all subagents.
-  Dangerous bash (`rm -rf`, `git reset --hard`, `sudo`, …) prompts everywhere. Subagent
-  requests are proxied over a Unix socket and appear in the parent TUI labeled with the
-  agent's name; concurrent prompts are serialized. Normal `write`/`edit` calls follow the
-  subagent's configured tool allowlist without an extra prompt. No UI / no channel blocks
-  dangerous bash calls.
+- **Parent-side approval coordinator** - dangerous-command policy itself lives in
+  [`@nilskluewer/pi-auto-permission-gate`](https://github.com/nilskluewer/pi-auto-permission-gate),
+  which loads in the main agent and in every subagent child.
+  When a child needs a manual confirmation, the gate proxies it over a Unix socket and the
+  prompt appears in the parent TUI labeled with the agent's name; concurrent prompts are
+  serialized. Normal `write`/`edit` calls follow the subagent's configured tool allowlist
+  without an extra prompt. No UI and no approval channel blocks the call.
 
-Replaces both `@nilskluewer/pi-minimal-subagent` (the `delegate` tool) and the standalone
-permission-gate extension.
+Replaces `@nilskluewer/pi-minimal-subagent` (the `delegate` tool).
+Install the permission gate extension alongside this one to keep dangerous bash commands
+gated in the main agent and in subagents.
 
 ## Install
 
@@ -76,10 +78,11 @@ Single, inline persona:
 { "systemPrompt": "You are a security reviewer...", "name": "security", "model": "anthropic-vertex/claude-sonnet-5", "tools": "read,grep,find,ls", "thinking": "high", "task": "Review src/auth.ts" }
 ```
 
-`thinking` is one of `off | minimal | low | medium | high | xhigh`. Omit it to inherit the global
-default (`defaultThinkingLevel` in `~/.pi/agent/settings.json`, same as the main agent). Settable
-inline, in named-agent frontmatter, or overridden per `resume` call; a resumed session without an
-override keeps whatever it was created with.
+`thinking` is one of `off | minimal | low | medium | high | xhigh | max`.
+Omit it to inherit the configured subagent default, then Pi's child-process default.
+It can be set inline, in named-agent frontmatter, or overridden per `resume` call.
+A resumed session without an override keeps the model and thinking metadata recorded when that session was created.
+If older metadata omits either field, current subagent defaults are not injected, so Pi can restore that field from the session JSONL.
 
 Parallel council (e.g. from an expert-council-review skill):
 
@@ -167,20 +170,43 @@ Mixed parallel caps:
 
 ## Subagent configuration
 
-`~/.pi/agent/subagent.json` configures delegation guidance, result capping, nested depth, and the root-scoped live-child budget for the `subagent` tool.
+`~/.pi/agent/subagent.json` configures delegation guidance, result capping, nested depth, the root-scoped live-child budget, and subagent call defaults.
 The file is optional.
-Missing or invalid JSON falls back to the defaults.
+Missing or malformed JSON falls back to safe built-in values, and a malformed file is never overwritten by `/subagent-defaults`.
 Policy, cap, depth, and budget changes take effect at the next session start, such as `/new`, `/resume`, `/fork`, `/reload`, or restarting Pi.
+Model and thinking defaults changed with `/subagent-defaults` apply to future subagent calls immediately.
 
 ```jsonc
 {
   "delegationPolicy": "explicit-request-only",
   "resultCapTokens": 1000,
+  "defaultModel": "anthropic-vertex/claude-sonnet-5",
+  "defaultThinkingLevel": "medium",
   "maxDepth": 2,
   "maxLiveChildren": 4,
   "budgetAcquireTimeoutMs": 120000
 }
 ```
+
+### `/subagent-defaults`
+
+Use `/subagent-defaults` with no arguments in the UI for an interactive picker.
+The model picker and model argument completions use only models scoped to the current Pi session.
+Configure a session model scope with Pi's `--models` option or the `enabledModels` setting before using them.
+Use `/subagent-defaults show` to display the current values without changing the main agent model.
+Use `/subagent-defaults model <provider/model-id>` to set an exact model from Pi's current model registry.
+Use `/subagent-defaults thinking <off|minimal|low|medium|high|xhigh|max>` to set the default thinking level.
+Use `/subagent-defaults clear model` or `/subagent-defaults model clear` to clear only the model default.
+Use `/subagent-defaults clear thinking` or `/subagent-defaults thinking clear` to clear only the thinking default.
+Use `/subagent-defaults clear` or `/subagent-defaults reset` to clear both defaults.
+
+Model references are validated with Pi's exact `provider/model-id` registry lookup before they are persisted.
+Known models can be configured even when their provider is not currently authenticated.
+Unknown models are rejected and are never written to `subagent.json`.
+The command preserves unrelated JSON keys and uses a safe atomic update.
+The effective defaults are passed to child Pi processes as `--model` and `--thinking` when set.
+Explicit tool-call values take precedence over named-agent frontmatter, resumed session metadata, subagent defaults, and Pi child-process defaults.
+A resumed session's recorded model and thinking metadata remains authoritative unless the resume call explicitly overrides it.
 
 `delegationPolicy` accepts:
 
@@ -242,8 +268,10 @@ System prompt goes here.
   `maxDepth: 2`, depth-1 children can spawn depth-2 leaves; depth-2 leaves cannot spawn deeper.
 - The root process owns a coordinator socket when UI approvals are needed or when `maxDepth > 1`
   (the default). Children receive `PI_SUBAGENT_COORDINATOR_SOCKET` for approval proxying,
-  live-child budget leases, and compact `+N nested` widget status updates. This environment
-  variable is internal; `PI_SUBAGENT_INHERITED_TOOLS` remains the public inheritance contract.
+  live-child budget leases, and compact `+N nested` widget status updates. The permission gate
+  extension is the client for the approval part of that protocol (see
+  `extensions/subagent/approval-protocol.ts`). This environment variable is internal;
+  `PI_SUBAGENT_INHERITED_TOOLS` remains the public inheritance contract.
 - Aborting a subagent attempts to terminate the whole spawned process group on macOS and Linux.
   Windows uses a best-effort `taskkill /pid <pid> /t /f` fallback that is implemented but untested.
 - Every child is spawned with `PI_SUBAGENT_INHERITED_TOOLS`: a comma-separated list of the
