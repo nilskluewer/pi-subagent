@@ -234,7 +234,7 @@ test("interactive model picker uses scoped models and falls back to available mo
   });
 });
 
-test("subagent tool definition uses one combined model field and concise guidance", async () => {
+test("subagent tool definition uses one required task and concise guidance", async () => {
   await withTempAgentDir(async () => {
     let definition;
     registerSubagentTool({
@@ -243,10 +243,63 @@ test("subagent tool definition uses one combined model field and concise guidanc
       },
     });
     assert.equal(definition.promptSnippet, "Delegate a self-contained task to a separate Pi agent.");
-    assert.match(definition.description, /Choose one mode/);
+    assert.match(definition.description, /one task/);
+    assert.match(definition.description, /same assistant turn/);
+    assert.match(definition.description, /previous result/);
     assert.equal(definition.parameters.properties.thinking, undefined);
     assert.match(definition.parameters.properties.model.description, /provider\/model-id\[:thinking-level\]/);
-    assert.equal(definition.parameters.properties.tasks.maxItems, 8);
+    assert.equal(definition.parameters.properties.async.type, "boolean");
+    assert.deepEqual(definition.parameters.required, ["task"]);
+  });
+});
+
+test("model schema uses the configured allowlist enum and otherwise stays free-form", async () => {
+  await withTempAgentDir(async (dir) => {
+    fs.writeFileSync(
+      path.join(dir, "subagent.json"),
+      JSON.stringify({ allowedModels: ["known/model-a:high", "known/model-b:medium"] }),
+    );
+    const definitions = [];
+    registerSubagentTool({ registerTool(value) { definitions.push(value); } });
+    const subagent = definitions.find((value) => value.name === "subagent");
+
+    assert.deepEqual(subagent.parameters.properties.model.enum, ["known/model-a:high", "known/model-b:medium"]);
+    assert.match(subagent.parameters.properties.model.description, /must be one of/);
+
+    fs.rmSync(path.join(dir, "subagent.json"));
+    const withoutAllowlist = [];
+    registerSubagentTool({ registerTool(value) { withoutAllowlist.push(value); } });
+    const freeForm = withoutAllowlist.find((value) => value.name === "subagent");
+    assert.equal(freeForm.parameters.properties.model.enum, undefined);
+    assert.equal(freeForm.parameters.properties.model.type, "string");
+  });
+});
+
+test("subagent schemas expose no legacy modes or minimum string and array constraints", async () => {
+  await withTempAgentDir(async () => {
+    const definitions = [];
+    registerSubagentTool({
+      registerTool(value) {
+        definitions.push(value);
+      },
+    });
+    const definition = definitions.find((value) => value.name === "subagent");
+    const waitDefinition = definitions.find((value) => value.name === "subagent_wait");
+    const properties = definition.parameters.properties;
+    assert.deepEqual(Object.keys(waitDefinition.parameters.properties).sort(), ["all", "id", "timeoutMs"]);
+    assert.equal(properties.tasks, undefined);
+    assert.equal(properties.chain, undefined);
+
+    const forbidden = new Set(["minLength", "minItems", "maxItems"]);
+    function assertNoForbiddenConstraints(value, location = "parameters") {
+      if (!value || typeof value !== "object") return;
+      for (const [key, nested] of Object.entries(value)) {
+        assert.equal(forbidden.has(key), false, `${location}.${key} must not be present`);
+        assertNoForbiddenConstraints(nested, `${location}.${key}`);
+      }
+    }
+    assertNoForbiddenConstraints(definition.parameters);
+    assertNoForbiddenConstraints(waitDefinition.parameters);
   });
 });
 
@@ -385,6 +438,15 @@ test("model allowlists override defaults and enforce exact combined specificatio
     );
     assert.match(rejected.error, /disallowed model/);
     assert.match(rejected.error, /known\/model-a:high/);
+
+    const unknownAllowed = resolveSpec(
+      { systemPrompt: "inline", model: "known/missing:high", task: "run" },
+      [],
+      0,
+      defaults,
+      modelRegistry,
+    );
+    assert.match(unknownAllowed.error, /Allowed models: known\/model-a:high, known\/model-b:medium/);
   });
 });
 

@@ -20,6 +20,7 @@ import { registerSubagentDefaultsCommand } from "./defaults-command.ts";
 import { setActiveToolsProvider } from "./inherited-tools.ts";
 import { DEFAULT_BUDGET_ACQUIRE_TIMEOUT_MS, DEFAULT_MAX_DEPTH, DEFAULT_MAX_LIVE_CHILDREN, loadSubagentConfig, shouldRegisterSubagentTools, treePolicyFromEnv } from "./config.ts";
 import { registerSubagentTool } from "./subagent-tool.ts";
+import { clearBackgroundRuns, disposeBackgroundRuns } from "./background-runs.ts";
 
 function currentDepth(): number {
 	const depth = Number(process.env.PI_SUBAGENT_DEPTH ?? "0");
@@ -41,6 +42,10 @@ export default function (pi: ExtensionAPI) {
 	// root, child, UI, and headless extension runtimes alike.
 	registerSubagentDefaultsCommand(pi);
 	setActiveToolsProvider(() => pi.getActiveTools());
+	pi.on("session_shutdown", () => {
+		disposeBackgroundRuns();
+		clearBackgroundRuns();
+	});
 	pi.on("session_start", () => {
 		const depth = currentDepth();
 		const treePolicy = depth > 0

@@ -23,11 +23,10 @@ export function capText(
 }
 
 export function resolveResultCap(
-	itemLevel: number | undefined,
 	callLevel: number | undefined,
 	configLevel: number | undefined,
 ): number {
-	return itemLevel ?? callLevel ?? configLevel ?? DEFAULT_RESULT_CAP_TOKENS;
+	return callLevel ?? configLevel ?? DEFAULT_RESULT_CAP_TOKENS;
 }
 
 function resultStatus(result: SingleResult): "completed" | "failed" | "aborted" {
@@ -43,14 +42,25 @@ export function formatEnvelope(
 ): string {
 	const model = result.model ?? "default";
 	const thinking = result.thinking ? ` | thinking: ${result.thinking}` : "";
+	const cost = typeof result.usage?.cost === "number" && Number.isFinite(result.usage.cost) && result.usage.cost > 0
+		? ` | cost: $${result.usage.cost.toFixed(4)}`
+		: "";
+	const turns = ` | turns: ${result.usage?.turns ?? 0}`;
 	const session = result.sessionId ?? "unavailable";
-	const header = `[agent: ${result.agent} | model: ${model}${thinking} | status: ${resultStatus(result)} | session: ${session}]`;
+	const header = `[agent: ${result.agent} | model: ${model}${thinking} | status: ${resultStatus(result)}${cost}${turns} | session: ${session}]`;
 	const parts = [header, capped.text || "(no output)"];
 
 	if (capped.truncated) {
 		const originalApproxTokens = capped.originalApproxTokens ?? approxTokens(capped.text);
 		const cappedTokens = opts.maxTokens <= 0 ? originalApproxTokens : Math.min(opts.maxTokens, originalApproxTokens);
-		if (result.sessionFile && result.sessionId) {
+		if (result.outputFile) {
+			const resumeHint = result.sessionId
+				? ` Then resume session "${result.sessionId}" to continue this agent with full context.`
+				: "";
+			parts.push(
+				`[truncated: showing ~${cappedTokens} of ~${originalApproxTokens} approx. tokens. Full output: read ${result.outputFile} with the normal read tool; use offsets to inspect parts of it.${resumeHint}]`,
+			);
+		} else if (result.sessionFile && result.sessionId) {
 			parts.push(
 				`[truncated: showing ~${cappedTokens} of ~${originalApproxTokens} approx. tokens. Full output: read ${result.sessionFile} directly (the JSONL tail has the rest), or resume session "${result.sessionId}" to continue this agent with full context.]`,
 			);

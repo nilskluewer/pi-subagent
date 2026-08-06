@@ -4,6 +4,7 @@ import * as net from "node:net";
 import test from "node:test";
 
 import { acquireChildSlot } from "../extensions/subagent/agent-budget.ts";
+import { classifySlotDenial } from "../extensions/subagent/subagent-tool.ts";
 import { startApprovalServer } from "../extensions/subagent/approval-server.ts";
 
 function delay(ms) {
@@ -38,6 +39,20 @@ function rawAcquire(socketPath, agent = "raw") {
 function approvalServer(select) {
   return startApprovalServer({ select }, { maxLiveChildren: 2, acquireTimeoutMs: 1000 });
 }
+
+test("a cancelled slot request is reported as aborted rather than budget exhaustion", () => {
+  const aborted = classifySlotDenial("aborted", 4);
+  assert.equal(aborted.stopReason, "aborted");
+  assert.match(aborted.message, /aborted/);
+
+  const exhausted = classifySlotDenial("budget exhausted", 4);
+  assert.equal(exhausted.stopReason, "error");
+  assert.match(exhausted.message, /max 4 live subagents/);
+
+  const unavailable = classifySlotDenial("coordinator unavailable", 4);
+  assert.equal(unavailable.stopReason, "error");
+  assert.match(unavailable.message, /coordinator unavailable/);
+});
 
 test("child budget grants under capacity, queues FIFO, and releases on close", async () => {
   const server = startApprovalServer({}, { maxLiveChildren: 2, acquireTimeoutMs: 1000 });

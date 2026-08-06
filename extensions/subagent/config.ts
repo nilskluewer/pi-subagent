@@ -48,7 +48,7 @@ export const TREE_POLICY_ENV = {
 
 export const OPERATIONAL_GUIDELINES = [
 	"Give each subagent a concrete, self-contained task with relevant paths, constraints, and expected output.",
-	"Use parallel tasks only when their work is independent and write scopes do not overlap; use sequential or chain execution when tasks depend on one another.",
+	"Emit several `subagent` calls in one assistant turn for independent parallel work with disjoint write scopes; call again with the previous result when tasks depend on one another.",
 	"Avoid duplicating work unless an independent second opinion is useful.",
 ];
 

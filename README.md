@@ -6,8 +6,10 @@
 
 One subagent extension for Pi that covers exactly what a multi-agent workflow needs:
 
-- **`subagent` tool** - delegate tasks to isolated `pi` child processes with single,
-  parallel (up to 8 tasks, concurrency 4), and chain (`{previous}` placeholder) modes.
+- **`subagent` tool** - delegate one task to an isolated `pi` child process per call.
+  Emit several `subagent` calls in the same assistant turn for independent parallel work.
+  Call again with the previous result when work depends on an earlier task.
+- **`subagent_wait` tool** - collect results from background calls started with `async: true`.
 - **Inline-first personas** - pass `systemPrompt` (+ optional `name`, `model`, and `tools`)
   directly in the tool call. Use `model` as `provider/model-id[:thinking-level]`.
   Skills define personas in their own text; no agent files are needed.
@@ -22,7 +24,7 @@ One subagent extension for Pi that covers exactly what a multi-agent workflow ne
   assistant messages/tool calls so it can inspect the working tree and resume intelligently.
 - **Live widget** - per-agent row above the editor: status, model, current tool, tokens, and
   turns. The configured model is visible immediately; `default` is shown until an inherited
-  model resolves. Completed single, chain, and parallel views also show each model.
+  model resolves. Completed subagent views also show each model.
   Press Ctrl+O on the running tool call to inspect streaming output.
 - **Nested delegation with a root budget** - by default, depth-1 subagents can spawn one
   more level of subagents (`maxDepth: 2`). A root-scoped coordinator enforces a default
@@ -73,7 +75,7 @@ and config reference on a single page.
 
 ## Tool usage
 
-Single, inline persona:
+One call with an inline persona:
 
 ```jsonc
 { "systemPrompt": "You are a security reviewer...", "name": "security", "model": "anthropic-vertex/claude-sonnet-5:high", "tools": "read,grep,find,ls", "task": "Review src/auth.ts" }
@@ -83,15 +85,8 @@ Single, inline persona:
 Thinking levels are `off | minimal | low | medium | high | xhigh | max`.
 Omit the model to use the configured or child-process default.
 
-Parallel council (e.g. from an expert-council-review skill):
-
-```jsonc
-{ "tasks": [
-  { "systemPrompt": "You are a correctness reviewer...", "name": "correctness", "task": "Review src/auth.ts" },
-  { "systemPrompt": "You are a security reviewer...", "name": "security", "task": "Review src/auth.ts" },
-  { "systemPrompt": "You are an architecture reviewer...", "name": "architecture", "task": "Review src/auth.ts" }
-] }
-```
+For independent work, emit several separate `subagent` calls in the same assistant turn.
+Give each call a disjoint write scope so the calls can run concurrently without conflicts.
 
 Continue an agent later (session id is in every result):
 
@@ -111,13 +106,11 @@ Named agent:
 { "agent": "example-researcher", "task": "Where is the retry logic implemented?" }
 ```
 
-Chain (sequential, `{previous}` is the prior step's output):
+For dependent work, call `subagent` again with the previous result in the new task.
+Pass the returned session id as `resume` when the same agent should continue with its full context.
 
 ```jsonc
-{ "chain": [
-  { "agent": "example-researcher", "task": "Summarize the auth flow" },
-  { "systemPrompt": "You write concise ADRs.", "name": "adr-writer", "task": "Write an ADR based on: {previous}" }
-] }
+{ "systemPrompt": "You write concise ADRs.", "name": "adr-writer", "task": "Write an ADR based on the previous review result:\n\n<previous result>" }
 ```
 
 ## Context forking
@@ -145,26 +138,20 @@ The cap affects only the model-facing tool result text for non-aborted results.
 It never truncates the child process, the child session file, or the rich details used by the TUI and Ctrl+O.
 The default cap is 1000 approximate tokens.
 Set `resultCapTokens` to `0` to disable capping.
-Precedence is per-item `resultCapTokens`, then top-level call `resultCapTokens`, then `~/.pi/agent/subagent.json`, then the built-in default of `1000`.
-This lets one parallel task stay uncapped while others remain small.
+Precedence is the call's `resultCapTokens`, then `~/.pi/agent/subagent.json`, then the built-in default of `1000`.
+Set the cap separately on each call when several subagents run concurrently.
+When a run finishes, its uncapped result payload is written atomically to `<sessionsDir>/<sessionId>.output.md` with restrictive permissions.
+If the result is truncated, the envelope points to that artifact first and recommends the normal `read` tool with offsets for inspecting parts of it.
+The envelope header includes non-zero cost and turn counts, while zero or unknown cost is omitted.
 
 Envelope example:
 
 ```text
-[agent: reviewer | model: github-copilot/gpt-5.6-luna | status: completed | session: 0197c0de]
+[agent: reviewer | model: github-copilot/gpt-5.6-luna | status: completed | cost: $0.0042 | turns: 3 | session: 0197c0de]
 
 Result text...
 
-[truncated: showing ~1000 of ~4200 approx. tokens. Full output: read /Users/me/.pi/agent/subagent-sessions/0197c0de.jsonl directly (the JSONL tail has the rest), or resume session "0197c0de" to continue this agent with full context.]
-```
-
-Mixed parallel caps:
-
-```jsonc
-{ "resultCapTokens": 500, "tasks": [
-  { "name": "lint", "systemPrompt": "Check lint output.", "task": "Summarize lint issues." },
-  { "name": "deep-review", "systemPrompt": "Do a deep review.", "resultCapTokens": 0, "task": "Return the full review." }
-] }
+[truncated: showing ~1000 of ~4200 approx. tokens. Full output: read /Users/me/.pi/agent/subagent-sessions/0197c0de.output.md with the normal read tool; use offsets to inspect parts of it. Then resume session "0197c0de" to continue this agent with full context.]
 ```
 
 ## Subagent configuration
@@ -175,7 +162,8 @@ Missing or malformed JSON falls back to safe built-in values, and a malformed fi
 Policy, cap, depth, and budget changes take effect at the next session start, such as `/new`, `/resume`, `/fork`, `/reload`, or restarting Pi.
 The model default changed with `/subagent-defaults` applies to future subagent calls immediately.
 Thinking levels are configured in the combined `model` value.
-The `allowedModels` policy is also read for every subagent call, so allowlist edits apply immediately.
+The `allowedModels` policy is read from the live file for every subagent call, so the runtime still enforces the live file immediately after an edit.
+The model schema enum snapshots the allowlist when the tools register, so allowlist changes require a Pi session restart before the schema reflects them.
 The current scoped model candidates are injected into the system prompt each turn.
 When no scope is active, the candidates fall back to Pi's available model registry.
 
@@ -225,7 +213,7 @@ An explicit tool-call model takes precedence over named-agent configuration, the
 - Any other string: use it verbatim as the policy line.
 
 `resultCapTokens` is a non-negative number.
-`0` disables the configured default cap unless a per-call or per-item value overrides it.
+`0` disables the configured default cap unless a per-call value overrides it.
 
 `maxDepth` is a positive integer.
 The default is `2`, so depth-1 subagents get the `subagent` tool and can spawn depth-2 leaves.
@@ -233,10 +221,24 @@ Set `maxDepth` to `1` to opt out of nested delegation and restore the old behavi
 
 `maxLiveChildren` is a positive integer and defaults to `4`.
 It is enforced tree-wide by the root coordinator, not separately in each branch.
-A normal root-level parallel batch with up to 4 running tasks behaves as before, while parallelism plus nesting is bounded across the whole tree.
+Several root-level calls emitted in one assistant turn run concurrently, while each delegation tree remains bounded by its configured live-child budget.
 
 `budgetAcquireTimeoutMs` is a positive integer and defaults to `120000`.
 If all live-child slots are busy for longer than this timeout, the attempted spawn returns a clear budget-exhausted result instead of waiting forever.
+
+## Delegating one task per call
+
+The `subagent` tool accepts one delegated task per call.
+Emit multiple `subagent` calls in the same assistant turn for independent parallel work.
+For dependent work, call again with the previous result or pass a returned session id as `resume`.
+
+Set `async` to `true` to start a subagent without blocking the parent turn.
+The async response names the agent and session id, and instructs the parent to call `subagent_wait` with that id.
+Call `subagent_wait` with `all: true` to collect every tracked run, omit `id` to collect the first run to finish, or pass `timeoutMs` to bound the wait.
+Background runs are tracked and collectable only during the current Pi session.
+A timeout reports still-running session ids without cancelling their child processes.
+Completed and failed results remain available for repeated collection by session id during the current session.
+Session shutdown aborts running children and forgets the background-run registry.
 
 ## Default-on nesting change in 0.5.0
 

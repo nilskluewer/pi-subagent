@@ -5,26 +5,37 @@ export type ChildSlotLease =
 	| { granted: true; release: () => void }
 	| { granted: false; reason: string };
 
-export function acquireChildSlot(socketPath: string, agent: string, timeoutMs: number): Promise<ChildSlotLease> {
+export function acquireChildSlot(
+	socketPath: string,
+	agent: string,
+	timeoutMs: number,
+	signal?: AbortSignal,
+): Promise<ChildSlotLease> {
 	return new Promise((resolve) => {
 		const id = crypto.randomUUID();
 		const socket = net.connect(socketPath);
 		let buffer = "";
 		let settled = false;
-		const timeout = setTimeout(() => {
-			if (settled) return;
-			settled = true;
-			socket.destroy();
-			resolve({ granted: false, reason: "budget exhausted" });
-		}, Math.max(1, timeoutMs));
+		let abortListener: (() => void) | undefined;
+		let timeout: NodeJS.Timeout;
+
+		const cleanup = () => {
+			clearTimeout(timeout);
+			if (abortListener && signal) signal.removeEventListener("abort", abortListener);
+			abortListener = undefined;
+		};
 
 		const deny = (reason: string) => {
 			if (settled) return;
 			settled = true;
-			clearTimeout(timeout);
+			cleanup();
 			socket.destroy();
 			resolve({ granted: false, reason });
 		};
+
+		timeout = setTimeout(() => {
+			deny("budget exhausted");
+		}, Math.max(1, timeoutMs));
 
 		socket.on("connect", () => {
 			try {
@@ -52,7 +63,7 @@ export function acquireChildSlot(socketPath: string, agent: string, timeoutMs: n
 			if (reply.granted === true) {
 				if (settled) return;
 				settled = true;
-				clearTimeout(timeout);
+				cleanup();
 				let released = false;
 				resolve({
 					granted: true,
@@ -73,6 +84,12 @@ export function acquireChildSlot(socketPath: string, agent: string, timeoutMs: n
 		socket.on("close", () => {
 			if (!settled) deny("coordinator unavailable");
 		});
+
+		if (signal) {
+			abortListener = () => deny("aborted");
+			if (signal.aborted) abortListener();
+			else signal.addEventListener("abort", abortListener, { once: true });
+		}
 	});
 }
 
