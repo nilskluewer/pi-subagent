@@ -8,8 +8,9 @@ One subagent extension for Pi that covers exactly what a multi-agent workflow ne
 
 - **`subagent` tool** - delegate tasks to isolated `pi` child processes with single,
   parallel (up to 8 tasks, concurrency 4), and chain (`{previous}` placeholder) modes.
-- **Inline-first personas** - pass `systemPrompt` (+ optional `name`, `model`, `tools`, `thinking`)
-  directly in the tool call. Skills define personas in their own text; no agent files needed.
+- **Inline-first personas** - pass `systemPrompt` (+ optional `name`, `model`, and `tools`)
+  directly in the tool call. Use `model` as `provider/model-id[:thinking-level]`.
+  Skills define personas in their own text; no agent files are needed.
 - **Tool inheritance** - a subagent starts with the tools the main agent has, including
   extension tools that are activated per session (MCP bridges). Pass `tools` to narrow it.
 - **Named agents (optional)** - markdown definitions in `~/.pi/agent/agents/*.md`
@@ -75,14 +76,12 @@ and config reference on a single page.
 Single, inline persona:
 
 ```jsonc
-{ "systemPrompt": "You are a security reviewer...", "name": "security", "model": "anthropic-vertex/claude-sonnet-5", "tools": "read,grep,find,ls", "thinking": "high", "task": "Review src/auth.ts" }
+{ "systemPrompt": "You are a security reviewer...", "name": "security", "model": "anthropic-vertex/claude-sonnet-5:high", "tools": "read,grep,find,ls", "task": "Review src/auth.ts" }
 ```
 
-`thinking` is one of `off | minimal | low | medium | high | xhigh | max`.
-Omit it to inherit the configured subagent default, then Pi's child-process default.
-It can be set inline, in named-agent frontmatter, or overridden per `resume` call.
-A resumed session without an override keeps the model and thinking metadata recorded when that session was created.
-If older metadata omits either field, current subagent defaults are not injected, so Pi can restore that field from the session JSONL.
+`model` accepts an exact `provider/model-id` and an optional `:thinking-level` suffix.
+Thinking levels are `off | minimal | low | medium | high | xhigh | max`.
+Omit the model to use the configured or child-process default.
 
 Parallel council (e.g. from an expert-council-review skill):
 
@@ -170,49 +169,60 @@ Mixed parallel caps:
 
 ## Subagent configuration
 
-`~/.pi/agent/subagent.json` configures delegation guidance, result capping, nested depth, the root-scoped live-child budget, and subagent call defaults.
+`~/.pi/agent/subagent.json` configures delegation guidance, result capping, nested depth, the root-scoped live-child budget, subagent model defaults, and the optional model allowlist.
 The file is optional.
 Missing or malformed JSON falls back to safe built-in values, and a malformed file is never overwritten by `/subagent-defaults`.
 Policy, cap, depth, and budget changes take effect at the next session start, such as `/new`, `/resume`, `/fork`, `/reload`, or restarting Pi.
-Model and thinking defaults changed with `/subagent-defaults` apply to future subagent calls immediately.
+The model default changed with `/subagent-defaults` applies to future subagent calls immediately.
+Thinking levels are configured in the combined `model` value.
+The `allowedModels` policy is also read for every subagent call, so allowlist edits apply immediately.
+The current scoped model candidates are injected into the system prompt each turn.
+When no scope is active, the candidates fall back to Pi's available model registry.
 
 ```jsonc
 {
-  "delegationPolicy": "explicit-request-only",
+  "delegationPolicy": "proactive",
   "resultCapTokens": 1000,
-  "defaultModel": "anthropic-vertex/claude-sonnet-5",
-  "defaultThinkingLevel": "medium",
+  "defaultModel": "anthropic-vertex/claude-sonnet-5:medium",
+  "allowedModels": [
+    "github-copilot/gpt-5.6-luna:high",
+    "anthropic-vertex/claude-sonnet-5:medium"
+  ],
   "maxDepth": 2,
   "maxLiveChildren": 4,
   "budgetAcquireTimeoutMs": 120000
 }
 ```
 
+`allowedModels` is optional.
+When present, it overrides `defaultModel` and restricts every subagent to the exact combined values in the list.
+Each entry must use `provider/model-id:thinking-level`.
+The first entry is the fallback when a call does not specify a model.
+An empty or malformed `allowedModels` value fails closed and prevents subagent resolution.
+
 ### `/subagent-defaults`
 
 Use `/subagent-defaults` with no arguments in the UI for an interactive picker.
-The model picker and model argument completions use only models scoped to the current Pi session.
-Configure a session model scope with Pi's `--models` option or the `enabledModels` setting before using them.
+The model picker and model argument completions use scoped models when a scope is active and all available models otherwise.
+Configure a session model scope with Pi's `--models` option or the `enabledModels` setting to narrow the candidates.
 Use `/subagent-defaults show` to display the current values without changing the main agent model.
-Use `/subagent-defaults model <provider/model-id>` to set an exact model from Pi's current model registry.
-Use `/subagent-defaults thinking <off|minimal|low|medium|high|xhigh|max>` to set the default thinking level.
-Use `/subagent-defaults clear model` or `/subagent-defaults model clear` to clear only the model default.
-Use `/subagent-defaults clear thinking` or `/subagent-defaults thinking clear` to clear only the thinking default.
-Use `/subagent-defaults clear` or `/subagent-defaults reset` to clear both defaults.
+Use `/subagent-defaults model <provider/model-id[:thinking]>` to set an exact model specification from Pi's current model registry.
+Use `/subagent-defaults clear model` or `/subagent-defaults model clear` to clear the model default.
+Use `/subagent-defaults clear` or `/subagent-defaults reset` to clear the model default.
+Thinking levels are part of each combined model specification.
 
-Model references are validated with Pi's exact `provider/model-id` registry lookup before they are persisted.
+Model specifications are validated with Pi's exact registry lookup before they are persisted.
 Known models can be configured even when their provider is not currently authenticated.
 Unknown models are rejected and are never written to `subagent.json`.
 The command preserves unrelated JSON keys and uses a safe atomic update.
-The effective defaults are passed to child Pi processes as `--model` and `--thinking` when set.
-Explicit tool-call values take precedence over named-agent frontmatter, resumed session metadata, subagent defaults, and Pi child-process defaults.
-A resumed session's recorded model and thinking metadata remains authoritative unless the resume call explicitly overrides it.
+The extension splits the combined value into `--model` and `--thinking` when launching a child process.
+An explicit tool-call model takes precedence over named-agent configuration, the configured default, resumed-session metadata, and the Pi child-process default.
 
 `delegationPolicy` accepts:
 
-- `"explicit-request-only"` (default): only use `subagent` when the user or an active skill explicitly asks for delegation, a parallel review/council, or a named agent.
-- `"proactive"`: allow opportunistic delegation for self-contained, well-specified work that can run without blocking the next step.
-- Any other string: used verbatim as the policy line.
+- `"proactive"` (default): use subagents when they can make useful independent progress.
+- `"explicit-request-only"`: only use `subagent` when the user or an active skill explicitly requests delegation.
+- Any other string: use it verbatim as the policy line.
 
 `resultCapTokens` is a non-negative number.
 `0` disables the configured default cap unless a per-call or per-item value overrides it.
@@ -250,8 +260,7 @@ All `subagent` calls are persistent, resumable sessions.
 name: example-researcher
 description: Read-only research agent
 tools: read, grep, find, ls
-model: anthropic-vertex/claude-sonnet-5
-thinking: medium
+model: anthropic-vertex/claude-sonnet-5:medium
 ---
 
 System prompt goes here.

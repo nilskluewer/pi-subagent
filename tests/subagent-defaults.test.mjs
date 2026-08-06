@@ -8,7 +8,6 @@ import {
   canonicalModelReference,
   getSubagentConfigPath,
   loadSubagentConfig,
-  SUBAGENT_THINKING_LEVELS,
   updateSubagentDefaults,
 } from "../extensions/subagent/config.ts";
 import {
@@ -19,7 +18,7 @@ import {
   parseSubagentDefaultsCommand,
   registerSubagentDefaultsCommand,
 } from "../extensions/subagent/defaults-command.ts";
-import { buildPiArguments, resolveSpec, resolveSubagentDefaults } from "../extensions/subagent/subagent-tool.ts";
+import { buildPiArguments, registerSubagentTool, resolveSpec, resolveSubagentDefaults } from "../extensions/subagent/subagent-tool.ts";
 
 async function withTempAgentDir(fn) {
   const previous = process.env.PI_CODING_AGENT_DIR;
@@ -42,6 +41,9 @@ function registry(models = [{ provider: "known", id: "model-a" }, { provider: "k
     getAll() {
       return models;
     },
+    getAvailable() {
+      return models;
+    },
   };
 }
 
@@ -58,33 +60,30 @@ function commandContext(modelRegistry = registry(), messages = []) {
   };
 }
 
-test("subagent config parses default model, all thinking levels, and preserves absent defaults", async () => {
+test("subagent config parses the combined model default", async () => {
   await withTempAgentDir((dir) => {
     fs.writeFileSync(
       path.join(dir, "subagent.json"),
-      JSON.stringify({ defaultModel: "known/model-a", defaultThinkingLevel: "max", otherSetting: true }),
+      JSON.stringify({ defaultModel: "known/model-a:high", otherSetting: true }),
     );
-    assert.equal(loadSubagentConfig().defaultModel, "known/model-a");
-    assert.equal(loadSubagentConfig().defaultThinkingLevel, "max");
-    assert.deepEqual(SUBAGENT_THINKING_LEVELS, ["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+    assert.equal(loadSubagentConfig().defaultModel, "known/model-a:high");
   });
 });
 
-test("config updates preserve unknown keys, clear defaults, and use restrictive permissions", async () => {
+test("config updates preserve unknown keys, clear the model default, and use restrictive permissions", async () => {
   await withTempAgentDir(async (dir) => {
     const configPath = path.join(dir, "subagent.json");
-    fs.writeFileSync(configPath, JSON.stringify({ customKey: { keep: true }, defaultModel: "known/model-a", defaultThinkingLevel: "high" }));
+    fs.writeFileSync(configPath, JSON.stringify({ customKey: { keep: true }, defaultModel: "known/model-a:high" }));
 
-    const updated = await updateSubagentDefaults({ defaultModel: "known/model-b", defaultThinkingLevel: "max" });
+    const updated = await updateSubagentDefaults({ defaultModel: "known/model-b:medium" });
     assert.equal(updated.ok, true);
     assert.deepEqual(JSON.parse(fs.readFileSync(configPath, "utf8")), {
       customKey: { keep: true },
-      defaultModel: "known/model-b",
-      defaultThinkingLevel: "max",
+      defaultModel: "known/model-b:medium",
     });
     assert.equal(fs.statSync(configPath).mode & 0o777, 0o600);
 
-    const cleared = await updateSubagentDefaults({ defaultModel: null, defaultThinkingLevel: null });
+    const cleared = await updateSubagentDefaults({ defaultModel: null });
     assert.equal(cleared.ok, true);
     assert.deepEqual(JSON.parse(fs.readFileSync(configPath, "utf8")), { customKey: { keep: true } });
   });
@@ -98,9 +97,9 @@ test("cleanup failure after rename does not turn a committed update into an erro
       throw new Error("simulated cleanup failure");
     };
     try {
-      const result = await updateSubagentDefaults({ defaultThinkingLevel: "high" });
+      const result = await updateSubagentDefaults({ defaultModel: "known/model-a:high" });
       assert.equal(result.ok, true);
-      assert.deepEqual(JSON.parse(fs.readFileSync(configPath, "utf8")), { defaultThinkingLevel: "high" });
+      assert.deepEqual(JSON.parse(fs.readFileSync(configPath, "utf8")), { defaultModel: "known/model-a:high" });
     } finally {
       fs.promises.rm = originalRemove;
     }
@@ -112,7 +111,7 @@ test("malformed config is readable as defaults but never overwritten", async () 
     const configPath = path.join(dir, "subagent.json");
     fs.writeFileSync(configPath, "{ definitely not json");
     assert.equal(loadSubagentConfig().defaultModel, undefined);
-    const result = await updateSubagentDefaults({ defaultThinkingLevel: "medium" });
+    const result = await updateSubagentDefaults({ defaultModel: "known/model-a:high" });
     assert.equal(result.ok, false);
     assert.equal(fs.readFileSync(configPath, "utf8"), "{ definitely not json");
   });
@@ -128,26 +127,17 @@ test("model references use strict registry lookup and canonical metadata", () =>
 test("subagent-defaults command parser documents the supported forms", () => {
   assert.deepEqual(parseSubagentDefaultsCommand(""), { kind: "interactive" });
   assert.deepEqual(parseSubagentDefaultsCommand("show"), { kind: "show" });
-  assert.deepEqual(parseSubagentDefaultsCommand("model provider/model-id"), { kind: "set-model", value: "provider/model-id" });
-  assert.deepEqual(parseSubagentDefaultsCommand("thinking MAX"), { kind: "set-thinking", value: "max" });
+  assert.deepEqual(parseSubagentDefaultsCommand("model provider/model-id:high"), { kind: "set-model", value: "provider/model-id:high" });
   assert.deepEqual(parseSubagentDefaultsCommand("clear model"), { kind: "clear", field: "model" });
   assert.deepEqual(parseSubagentDefaultsCommand("reset"), { kind: "clear" });
-  assert.equal(parseSubagentDefaultsCommand("thinking nope").kind, "set-thinking");
+  assert.equal(parseSubagentDefaultsCommand("thinking max").kind, "invalid");
   assert.match(parseSubagentDefaultsCommand("wat").message, /Usage/);
 });
 
 test("argument completions stay valid by command stage", () => {
   assert.deepEqual(
     getSubagentDefaultsArgumentCompletions("").map((item) => item.value),
-    ["show", "status", "list", "model", "thinking", "clear", "reset"],
-  );
-  assert.deepEqual(
-    getSubagentDefaultsArgumentCompletions("thinking ").map((item) => item.value),
-    ["thinking off", "thinking minimal", "thinking low", "thinking medium", "thinking high", "thinking xhigh", "thinking max", "thinking clear"],
-  );
-  assert.deepEqual(
-    getSubagentDefaultsArgumentCompletions("thinking h").map((item) => item.value),
-    ["thinking high"],
+    ["show", "status", "list", "model", "clear", "reset"],
   );
   assert.deepEqual(
     getSubagentDefaultsArgumentCompletions("model ", ["known/model-b", "known/model-a"]).map((item) => item.value),
@@ -155,7 +145,7 @@ test("argument completions stay valid by command stage", () => {
   );
   assert.deepEqual(
     getSubagentDefaultsArgumentCompletions("clear ").map((item) => item.value),
-    ["clear model", "clear thinking"],
+    ["clear model"],
   );
 });
 
@@ -180,8 +170,8 @@ test("registered command completions use only the scoped model snapshot", () => 
     ["model clear", "model known/model-a"],
   );
   assert.equal(definition.getArgumentCompletions("model ").some((item) => item.value.includes("model-z")), false);
-  assert.deepEqual(definition.getArgumentCompletions("thinking h").map((item) => item.value), ["thinking high"]);
-  assert.deepEqual(definition.getArgumentCompletions("clear ").map((item) => item.value), ["clear model", "clear thinking"]);
+  assert.equal(definition.getArgumentCompletions("thinking h"), null);
+  assert.deepEqual(definition.getArgumentCompletions("clear ").map((item) => item.value), ["clear model"]);
 });
 
 test("scoped model references are deduplicated without consulting a registry", () => {
@@ -195,7 +185,7 @@ test("scoped model references are deduplicated without consulting a registry", (
   );
 });
 
-test("interactive model picker uses only scoped models and warns when scope is empty", async () => {
+test("interactive model picker uses scoped models and falls back to available models", async () => {
   await withTempAgentDir(async () => {
     const scopedSelectCalls = [];
     const scopedMessages = [];
@@ -238,9 +228,25 @@ test("interactive model picker uses only scoped models and warns when scope is e
       },
     };
     await handleSubagentDefaultsCommand("", emptyContext);
-    assert.equal(emptySelectCalls.length, 1);
-    assert.match(emptyMessages.at(-1).message, /no scoped models/i);
-    assert.match(emptyMessages.at(-1).message, /--models/);
+    assert.equal(emptySelectCalls.length, 2);
+    assert.deepEqual(emptySelectCalls[1].options, ["known/model-a", "registry-only/model-z"]);
+    assert.equal(emptyMessages.length, 1);
+  });
+});
+
+test("subagent tool definition uses one combined model field and concise guidance", async () => {
+  await withTempAgentDir(async () => {
+    let definition;
+    registerSubagentTool({
+      registerTool(value) {
+        definition = value;
+      },
+    });
+    assert.equal(definition.promptSnippet, "Delegate a self-contained task to a separate Pi agent.");
+    assert.match(definition.description, /Choose one mode/);
+    assert.equal(definition.parameters.properties.thinking, undefined);
+    assert.match(definition.parameters.properties.model.description, /provider\/model-id\[:thinking-level\]/);
+    assert.equal(definition.parameters.properties.tasks.maxItems, 8);
   });
 });
 
@@ -248,64 +254,69 @@ test("command persists known models without changing the main agent and rejects 
   await withTempAgentDir(async () => {
     const messages = [];
     const context = commandContext(registry(), messages);
-    await handleSubagentDefaultsCommand("model known/model-a", context);
-    assert.equal(loadSubagentConfig().defaultModel, "known/model-a");
+    await handleSubagentDefaultsCommand("model known/model-a:high", context);
+    assert.equal(loadSubagentConfig().defaultModel, "known/model-a:high");
     assert.match(messages.at(-1).message, /main agent model was not changed/);
 
     const before = fs.readFileSync(getSubagentConfigPath(), "utf8");
     await handleSubagentDefaultsCommand("model known/missing", context);
     assert.equal(fs.readFileSync(getSubagentConfigPath(), "utf8"), before);
-    assert.equal(loadSubagentConfig().defaultModel, "known/model-a");
+    assert.equal(loadSubagentConfig().defaultModel, "known/model-a:high");
   });
 });
 
-test("command writes thinking max and clears only the requested default", async () => {
+test("command clears the model default", async () => {
   await withTempAgentDir(async () => {
     const context = commandContext();
-    await handleSubagentDefaultsCommand("model known/model-a", context);
-    await handleSubagentDefaultsCommand("thinking max", context);
-    assert.equal(loadSubagentConfig().defaultThinkingLevel, "max");
+    await handleSubagentDefaultsCommand("model known/model-a:high", context);
     await handleSubagentDefaultsCommand("clear model", context);
     assert.equal(loadSubagentConfig().defaultModel, undefined);
-    assert.equal(loadSubagentConfig().defaultThinkingLevel, "max");
-    assert.match(formatSubagentDefaults(loadSubagentConfig()), /thinking: max/);
+    assert.doesNotMatch(formatSubagentDefaults(loadSubagentConfig()), /default thinking/);
   });
 });
 
-test("resolution precedence is explicit call, named frontmatter, resume metadata, then defaults", async () => {
+test("model resolution uses explicit, named, resumed, then configured model specifications", async () => {
   await withTempAgentDir(async (dir) => {
-    const defaults = { defaultModel: "default/model", defaultThinkingLevel: "minimal" };
+    const modelRegistry = registry([
+      { provider: "known", id: "default/model" },
+      { provider: "known", id: "explicit/model" },
+      { provider: "known", id: "named/model" },
+      { provider: "known", id: "resume/model" },
+    ]);
+    const defaults = { defaultModel: "known/default/model:low" };
     const named = resolveSpec(
-      { agent: "reviewer", model: "explicit/model", thinking: "high", task: "review" },
-      [{ name: "reviewer", description: "review", systemPrompt: "review", model: "named/model", thinking: "low", source: "user", filePath: "agent.md" }],
+      { agent: "reviewer", model: "known/explicit/model:high", task: "review" },
+      [{ name: "reviewer", description: "review", systemPrompt: "review", model: "known/named/model:medium", source: "user", filePath: "agent.md" }],
       0,
       defaults,
+      modelRegistry,
     );
-    assert.equal(named.spec.model, "explicit/model");
+    assert.equal(named.spec.model, "known/explicit/model:high");
     assert.equal(named.spec.thinking, "high");
 
     const namedInherited = resolveSpec(
       { agent: "reviewer", task: "review" },
-      [{ name: "reviewer", description: "review", systemPrompt: "review", model: "named/model", thinking: "low", source: "user", filePath: "agent.md" }],
+      [{ name: "reviewer", description: "review", systemPrompt: "review", model: "known/named/model:medium", source: "user", filePath: "agent.md" }],
       0,
       defaults,
+      modelRegistry,
     );
-    assert.equal(namedInherited.spec.model, "named/model");
-    assert.equal(namedInherited.spec.thinking, "low");
+    assert.equal(namedInherited.spec.model, "known/named/model:medium");
+    assert.equal(namedInherited.spec.thinking, "medium");
 
     const sessionsDir = path.join(dir, "subagent-sessions");
     fs.mkdirSync(sessionsDir);
     fs.writeFileSync(path.join(sessionsDir, "resume-1.jsonl"), "");
     fs.writeFileSync(
       path.join(sessionsDir, "resume-1.meta.json"),
-      JSON.stringify({ name: "old", systemPrompt: "old", model: "resume/model", thinking: "medium" }),
+      JSON.stringify({ name: "old", systemPrompt: "old", model: "known/resume/model", thinking: "medium" }),
     );
-    const resumed = resolveSpec({ resume: "resume-1", task: "continue" }, [], 0, defaults);
-    assert.equal(resumed.spec.model, "resume/model");
+    const resumed = resolveSpec({ resume: "resume-1", task: "continue" }, [], 0, defaults, modelRegistry);
+    assert.equal(resumed.spec.model, "known/resume/model:medium");
     assert.equal(resumed.spec.thinking, "medium");
 
-    const resumedOverride = resolveSpec({ resume: "resume-1", model: "explicit/model", thinking: "max", task: "continue" }, [], 0, defaults);
-    assert.equal(resumedOverride.spec.model, "explicit/model");
+    const resumedOverride = resolveSpec({ resume: "resume-1", model: "known/explicit/model:max", task: "continue" }, [], 0, defaults, modelRegistry);
+    assert.equal(resumedOverride.spec.model, "known/explicit/model:max");
     assert.equal(resumedOverride.spec.thinking, "max");
 
     fs.writeFileSync(path.join(sessionsDir, "resume-missing.jsonl"), "");
@@ -313,7 +324,7 @@ test("resolution precedence is explicit call, named frontmatter, resume metadata
       path.join(sessionsDir, "resume-missing.meta.json"),
       JSON.stringify({ name: "old-missing", systemPrompt: "old" }),
     );
-    const resumedMissingMetadata = resolveSpec({ resume: "resume-missing", task: "continue" }, [], 0, defaults);
+    const resumedMissingMetadata = resolveSpec({ resume: "resume-missing", task: "continue" }, [], 0, defaults, modelRegistry);
     assert.equal(resumedMissingMetadata.spec.model, undefined);
     assert.equal(resumedMissingMetadata.spec.thinking, undefined);
     assert.deepEqual(
@@ -321,27 +332,99 @@ test("resolution precedence is explicit call, named frontmatter, resume metadata
       ["--mode", "json", "-p", "--session", resumedMissingMetadata.spec.sessionFile, "@/tmp/resume-task.md"],
     );
 
-    const inline = resolveSpec({ systemPrompt: "inline", task: "do" }, [], 0, defaults);
-    assert.equal(inline.spec.model, "default/model");
-    assert.equal(inline.spec.thinking, "minimal");
+    const inline = resolveSpec({ systemPrompt: "inline", task: "do" }, [], 0, defaults, modelRegistry);
+    assert.equal(inline.spec.model, "known/default/model:low");
+    assert.equal(inline.spec.thinking, "low");
+  });
+});
+
+test("model allowlists override defaults and enforce exact combined specifications", async () => {
+  await withTempAgentDir(async () => {
+    const modelRegistry = registry();
+    const defaults = resolveSubagentDefaults(
+      {
+        defaultModel: "known/model-b:low",
+        allowedModels: [
+          { model: "known/model-a", thinking: "high" },
+          { model: "known/model-b", thinking: "medium" },
+        ],
+      },
+      modelRegistry,
+    );
+
+    const implicit = resolveSpec({ systemPrompt: "inline", task: "run" }, [], 0, defaults, modelRegistry);
+    assert.equal(implicit.spec.model, "known/model-a:high");
+    assert.equal(implicit.spec.thinking, "high");
+
+    const allowed = resolveSpec(
+      { systemPrompt: "inline", model: "known/model-b:medium", task: "run" },
+      [],
+      0,
+      defaults,
+      modelRegistry,
+    );
+    assert.equal(allowed.spec.model, "known/model-b:medium");
+    assert.equal(allowed.spec.thinking, "medium");
+
+    const inferredThinking = resolveSpec(
+      { systemPrompt: "inline", model: "known/model-b", task: "run" },
+      [],
+      0,
+      defaults,
+      modelRegistry,
+    );
+    assert.equal(inferredThinking.spec.model, "known/model-b:medium");
+    assert.equal(inferredThinking.spec.thinking, "medium");
+
+    const rejected = resolveSpec(
+      { systemPrompt: "inline", model: "known/model-a:max", task: "run" },
+      [],
+      0,
+      defaults,
+      modelRegistry,
+    );
+    assert.match(rejected.error, /disallowed model/);
+    assert.match(rejected.error, /known\/model-a:high/);
+  });
+});
+
+test("an invalid configured model allowlist prevents subagent resolution", async () => {
+  await withTempAgentDir(async () => {
+    const defaults = resolveSubagentDefaults(
+      { allowedModels: [] },
+      registry(),
+    );
+    const result = resolveSpec({ systemPrompt: "inline", task: "run" }, [], 0, defaults, registry());
+    assert.match(result.error, /must contain at least one valid/);
+  });
+});
+
+test("an explicit unknown model fails before a child process is started", async () => {
+  await withTempAgentDir(async () => {
+    const result = resolveSpec(
+      { systemPrompt: "inline", model: "unknown/model:high", task: "run" },
+      [],
+      0,
+      {},
+      registry(),
+    );
+    assert.match(result.error, /Unknown subagent model/);
   });
 });
 
 test("future calls observe defaults written during the current session", async () => {
   await withTempAgentDir(async () => {
     const modelRegistry = registry();
-    await handleSubagentDefaultsCommand("model known/model-b", commandContext(modelRegistry));
-    await handleSubagentDefaultsCommand("thinking high", commandContext(modelRegistry));
+    await handleSubagentDefaultsCommand("model known/model-b:medium", commandContext(modelRegistry));
     assert.deepEqual(resolveSubagentDefaults(loadSubagentConfig(), modelRegistry), {
-      defaultModel: "known/model-b",
-      defaultThinkingLevel: "high",
+      defaultModel: "known/model-b:medium",
     });
   });
 });
 
-test("effective thinking max is passed to child pi arguments", () => {
+test("combined model specifications become separate child arguments", () => {
   assert.deepEqual(
-    buildPiArguments({ sessionFile: "/tmp/child.jsonl", model: "known/model-a", tools: undefined, thinking: "max" }, "/tmp/task.md"),
+    buildPiArguments({ sessionFile: "/tmp/child.jsonl", model: "known/model-a:max", tools: undefined, thinking: "max" }, "/tmp/task.md"),
     ["--mode", "json", "-p", "--session", "/tmp/child.jsonl", "--model", "known/model-a", "--thinking", "max", "@/tmp/task.md"],
   );
 });

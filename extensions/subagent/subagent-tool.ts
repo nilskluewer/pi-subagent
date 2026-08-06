@@ -30,7 +30,6 @@ import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { type Message, StringEnum, Type } from "@earendil-works/pi-ai";
 import {
-	CONFIG_DIR_NAME,
 	type ExtensionAPI,
 	getAgentDir,
 	getMarkdownTheme,
@@ -49,16 +48,19 @@ import type { ForkContext } from "./context-fork.ts";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
 import {
 	canonicalModelReference,
+	canonicalModelSelection,
+	formatModelSelection,
 	DEFAULT_BUDGET_ACQUIRE_TIMEOUT_MS,
 	DEFAULT_MAX_DEPTH,
 	DEFAULT_MAX_LIVE_CHILDREN,
 	OPERATIONAL_GUIDELINES,
 	TREE_POLICY_ENV,
 	buildDelegationPolicyLine,
+	isSubagentThinkingLevel,
 	loadSubagentConfig,
 	type ModelReferenceRegistry,
 	type SubagentConfig,
-	type SubagentThinkingLevel,
+	type SubagentModelAllowlistEntry,
 	treePolicyFromEnv,
 } from "./config.ts";
 import { inheritedToolsEnv } from "./inherited-tools.ts";
@@ -185,8 +187,9 @@ function formatToolCall(
 const plainFg = (_color: any, text: string) => text;
 
 function resultSettingsTag(result: Pick<SingleResult, "model" | "thinking">): string {
-	const model = result.model ?? "default";
-	return result.thinking ? `${model}, thinking:${result.thinking}` : model;
+	if (!result.model) return "default";
+	if (result.thinking && !result.model.endsWith(`:${result.thinking}`)) return `${result.model}:${result.thinking}`;
+	return result.model;
 }
 
 export interface UsageStats {
@@ -265,17 +268,43 @@ interface SessionMeta {
 
 export interface SubagentResolutionDefaults {
 	defaultModel?: string;
-	defaultThinkingLevel?: SubagentThinkingLevel;
+	allowedModels?: SubagentModelAllowlistEntry[];
+	allowedModelsError?: string;
+	defaultModelError?: string;
 }
 
 export function resolveSubagentDefaults(
-	config: Pick<SubagentConfig, "defaultModel" | "defaultThinkingLevel">,
+	config: Pick<SubagentConfig, "defaultModel" | "allowedModels">,
 	registry: ModelReferenceRegistry,
 ): SubagentResolutionDefaults {
-	return {
-		defaultModel: config.defaultModel ? canonicalModelReference(config.defaultModel, registry) : undefined,
-		defaultThinkingLevel: config.defaultThinkingLevel,
-	};
+	const resolved: SubagentResolutionDefaults = {};
+	if (config.allowedModels !== undefined) {
+		if (config.allowedModels.length === 0) {
+			resolved.allowedModelsError =
+				"Invalid subagent model allowlist: allowedModels must contain at least one valid provider/model-id:thinking entry.";
+		} else {
+			const entries: SubagentModelAllowlistEntry[] = [];
+			for (const entry of config.allowedModels) {
+				const model = canonicalModelReference(entry.model, registry);
+				if (!model) {
+					resolved.allowedModelsError = `Unknown model in subagent allowlist: "${entry.model}".`;
+					break;
+				}
+				if (!entries.some((existing) => existing.model === model && existing.thinking === entry.thinking)) {
+					entries.push({ model, thinking: entry.thinking });
+				}
+			}
+			if (!resolved.allowedModelsError) resolved.allowedModels = entries;
+		}
+	}
+
+	if (config.allowedModels === undefined && config.defaultModel) {
+		const selection = canonicalModelSelection(config.defaultModel, registry);
+		if (selection) resolved.defaultModel = formatModelSelection(selection);
+		else resolved.defaultModelError = `Unknown subagent default model "${config.defaultModel}".`;
+	}
+
+	return resolved;
 }
 
 interface TaskItemInput {
@@ -284,7 +313,6 @@ interface TaskItemInput {
 	name?: string;
 	model?: string;
 	tools?: string;
-	thinking?: string;
 	resume?: string;
 	forkContext?: string;
 	resultCapTokens?: number;
@@ -300,27 +328,128 @@ function parseToolsList(tools: string | undefined): string[] | undefined {
 	return parsed && parsed.length > 0 ? parsed : undefined;
 }
 
+function formatAllowedModelPairs(allowedModels: readonly SubagentModelAllowlistEntry[]): string {
+	return allowedModels.map((entry) => `${entry.model}:${entry.thinking}`).join(", ");
+}
+
+export function enforceModelAllowlist(
+	spec: AgentSpec,
+	allowedModels: readonly SubagentModelAllowlistEntry[] | undefined,
+	registry?: ModelReferenceRegistry,
+): { spec: AgentSpec } | { error: string } {
+	let selection = spec.model && registry ? canonicalModelSelection(spec.model, registry) : undefined;
+	if (spec.model && !selection) {
+		return { error: `Unknown subagent model "${spec.model}". Use an exact provider/model-id[:thinking].` };
+	}
+	if (selection && !selection.thinking && isSubagentThinkingLevel(spec.thinking)) {
+		selection = { ...selection, thinking: spec.thinking };
+	}
+
+	if (allowedModels === undefined) {
+		return {
+			spec: {
+				...spec,
+				model: selection ? formatModelSelection(selection) : spec.model,
+				thinking: selection?.thinking,
+			},
+		};
+	}
+	if (allowedModels.length === 0) {
+		return { error: "Subagent model allowlist is configured but contains no valid entries." };
+	}
+
+	let selected: SubagentModelAllowlistEntry | undefined;
+	if (selection) {
+		selected = allowedModels.find(
+			(entry) => entry.model === selection?.model && (!selection.thinking || entry.thinking === selection.thinking),
+		);
+	} else if (isSubagentThinkingLevel(spec.thinking)) {
+		selected = allowedModels.find((entry) => entry.thinking === spec.thinking);
+	} else {
+		selected = allowedModels[0];
+	}
+
+	if (!selected) {
+		const requested = spec.model ?? "(default model)";
+		return {
+			error: `Subagent "${spec.name}" requested disallowed model ${requested}. Allowed models: ${formatAllowedModelPairs(allowedModels)}.`,
+		};
+	}
+	if (selection && selection.thinking && selected.thinking !== selection.thinking) {
+		return {
+			error: `Subagent "${spec.name}" requested disallowed model ${formatModelSelection(selection)}. Allowed models: ${formatAllowedModelPairs(allowedModels)}.`,
+		};
+	}
+
+	return {
+		spec: {
+			...spec,
+			model: formatModelSelection({ model: selected.model, thinking: selected.thinking }),
+			thinking: selected.thinking,
+		},
+	};
+}
+
+const SESSION_ID_PATTERN = /^[\w.-]+$/;
+
+type ResolvedAgentSource =
+	| { kind: "resume"; sessionId: string; sessionFile: string }
+	| { kind: "agent"; agent: AgentConfig }
+	| { kind: "inline" };
+
+/**
+ * Choose the one agent source of a call that may also carry placeholder values.
+ * Precedence is resume > named agent > inline, and a field only counts when it
+ * can actually resolve: a session must exist on disk and an agent name must be
+ * known. Everything else falls through to the next source, so a model that fills
+ * every schema property still gets the run it asked for.
+ */
+export function selectAgentSource(
+	item: Pick<TaskItemInput, "agent" | "systemPrompt" | "resume">,
+	agents: AgentConfig[],
+	sessionsDir: string,
+): { source: ResolvedAgentSource } | { error: string } {
+	const resume = item.resume?.trim();
+	const sessionFile = resume && SESSION_ID_PATTERN.test(resume) ? path.join(sessionsDir, `${resume}.jsonl`) : undefined;
+	if (resume && sessionFile && fs.existsSync(sessionFile)) {
+		return { source: { kind: "resume", sessionId: resume, sessionFile } };
+	}
+
+	const agentName = item.agent?.trim();
+	const agent = agentName ? agents.find((a) => a.name === agentName) : undefined;
+	if (agent) return { source: { kind: "agent", agent } };
+
+	if (item.systemPrompt?.trim()) return { source: { kind: "inline" } };
+	if (resume) return { error: `Unknown subagent session "${resume}" (no transcript in ${sessionsDir}).` };
+	if (agentName) {
+		const available = agents.map((a) => `"${a.name}"`).join(", ") || "none";
+		return { error: `Unknown agent: "${agentName}". Available agents: ${available}.` };
+	}
+	return { error: 'Provide one of "agent" (named), "systemPrompt" (inline), or "resume" (session id).' };
+}
+
 export function resolveSpec(
 	item: TaskItemInput,
 	agents: AgentConfig[],
 	index: number,
 	defaults: SubagentResolutionDefaults = {},
+	registry?: ModelReferenceRegistry,
 ): { spec: AgentSpec } | { error: string } {
 	const forkContext = parseForkContext(item.forkContext);
 	if ("error" in forkContext) return { error: forkContext.error };
-	const provided = [item.agent, item.systemPrompt, item.resume].filter((v) => v?.trim()).length;
-	if (provided !== 1) {
-		return { error: 'Provide exactly one of "agent" (named), "systemPrompt" (inline), or "resume" (session id).' };
-	}
-	if (item.resume?.trim() && forkContext.mode !== "none") {
-		return { error: '"resume" and forkContext other than "none" are mutually exclusive.' };
-	}
-
 	const sessionsDir = getSessionsDir();
+	const selected = selectAgentSource(item, agents, sessionsDir);
+	if ("error" in selected) return { error: selected.error };
+	if (defaults.defaultModelError) return { error: defaults.defaultModelError };
+	if (defaults.allowedModelsError) return { error: defaults.allowedModelsError };
 
-	if (item.resume?.trim()) {
-		const sessionId = item.resume.trim();
-		const sessionFile = path.join(sessionsDir, `${sessionId}.jsonl`);
+	const finalize = (spec: AgentSpec): { spec: AgentSpec } | { error: string } =>
+		enforceModelAllowlist(spec, defaults.allowedModels, registry);
+	const defaultsAreOverridden = defaults.allowedModels !== undefined;
+	const defaultModel = defaultsAreOverridden ? undefined : defaults.defaultModel;
+
+	if (selected.source.kind === "resume") {
+		const { sessionId, sessionFile } = selected.source;
 		const metaFile = path.join(sessionsDir, `${sessionId}.meta.json`);
 		let meta: SessionMeta;
 		try {
@@ -328,71 +457,60 @@ export function resolveSpec(
 		} catch {
 			return { error: `Unknown subagent session "${sessionId}" (no metadata at ${metaFile}).` };
 		}
-		if (!fs.existsSync(sessionFile)) {
-			return { error: `Subagent session file missing for "${sessionId}" (${sessionFile}).` };
-		}
-		return {
-			spec: {
-				name: meta.name,
-				systemPrompt: meta.systemPrompt ?? "",
-				// A resumed Pi session restores its effective model and thinking level
-				// from the child JSONL. Do not inject current subagent defaults when
-				// older metadata omits either field, because --model/--thinking would
-				// override Pi's session restoration. Explicit resume-call overrides and
-				// recorded metadata remain authoritative.
-				model: item.model ?? meta.model,
-				tools: parseToolsList(item.tools) ?? meta.tools,
-				thinking: item.thinking ?? meta.thinking,
-				source: "resume",
-				sessionId,
-				sessionFile,
-				isResume: true,
-				forkContext,
-				parent: meta.parent,
-				rootId: meta.rootId,
-			},
-		};
+		return finalize({
+			name: meta.name,
+			systemPrompt: meta.systemPrompt ?? "",
+			// A resumed Pi session restores its effective model and thinking level
+			// from the child JSONL. Do not inject current subagent defaults when
+			// older metadata omits either field, because --model/--thinking would
+			// override Pi's session restoration. Explicit resume-call overrides and
+			// recorded metadata remain authoritative. An active model allowlist is
+			// applied afterward and supplies its first matching fallback if metadata
+			// is incomplete.
+			model: item.model ?? meta.model,
+			tools: parseToolsList(item.tools) ?? meta.tools,
+			thinking: meta.thinking,
+			source: "resume",
+			sessionId,
+			sessionFile,
+			isResume: true,
+			// A resumed session restores its own history, so a fork request cannot
+			// apply and is ignored rather than rejected.
+			forkContext: { mode: "none" },
+			parent: meta.parent,
+			rootId: meta.rootId,
+		});
 	}
 
 	const sessionId = crypto.randomUUID();
 	const sessionFile = path.join(sessionsDir, `${sessionId}.jsonl`);
 
-	if (item.agent?.trim()) {
-		const agent = agents.find((a) => a.name === item.agent);
-		if (!agent) {
-			const available = agents.map((a) => `"${a.name}"`).join(", ") || "none";
-			return { error: `Unknown agent: "${item.agent}". Available agents: ${available}.` };
-		}
-		return {
-			spec: {
-				name: agent.name,
-				systemPrompt: agent.systemPrompt,
-				model: item.model ?? agent.model ?? defaults.defaultModel,
-				tools: parseToolsList(item.tools) ?? agent.tools,
-				thinking: item.thinking ?? agent.thinking ?? defaults.defaultThinkingLevel,
-				source: agent.source,
-				sessionId,
-				sessionFile,
-				isResume: false,
-				forkContext,
-			},
-		};
-	}
-
-	return {
-		spec: {
-			name: item.name?.trim() || `agent-${index + 1}`,
-			systemPrompt: item.systemPrompt ?? "",
-			model: item.model ?? defaults.defaultModel,
-			tools: parseToolsList(item.tools),
-			thinking: item.thinking ?? defaults.defaultThinkingLevel,
-			source: "inline",
+	if (selected.source.kind === "agent") {
+		const agent = selected.source.agent;
+		return finalize({
+			name: agent.name,
+			systemPrompt: agent.systemPrompt,
+			model: item.model ?? agent.model ?? defaultModel,
+			tools: parseToolsList(item.tools) ?? agent.tools,
+			source: agent.source,
 			sessionId,
 			sessionFile,
 			isResume: false,
 			forkContext,
-		},
-	};
+		});
+	}
+
+	return finalize({
+		name: item.name?.trim() || `agent-${index + 1}`,
+		systemPrompt: item.systemPrompt ?? "",
+		model: item.model ?? defaultModel,
+		tools: parseToolsList(item.tools),
+		source: "inline",
+		sessionId,
+		sessionFile,
+		isResume: false,
+		forkContext,
+	});
 }
 
 export function writeSessionMeta(spec: AgentSpec, cwd: string): void {
@@ -562,7 +680,10 @@ export function buildPiArguments(
 	systemPromptPath?: string,
 ): string[] {
 	const args: string[] = ["--mode", "json", "-p", "--session", spec.sessionFile];
-	if (spec.model) args.push("--model", spec.model);
+	const model = spec.model && spec.thinking && spec.model.endsWith(`:${spec.thinking}`)
+		? spec.model.slice(0, -(spec.thinking.length + 1))
+		: spec.model;
+	if (model) args.push("--model", model);
 	if (spec.tools && spec.tools.length > 0) args.push("--tools", spec.tools.join(","));
 	if (spec.thinking) args.push("--thinking", spec.thinking);
 	if (systemPromptPath) args.push("--append-system-prompt", systemPromptPath);
@@ -1031,58 +1152,90 @@ export async function runSingleAgent(
 	}
 }
 
+// Never constrain these optional fields with minLength/minItems. Models that
+// fill every schema property emit "" or [] for unused fields, which the runtime
+// drops as absent; a minimum constraint makes them invent non-empty junk such as
+// resume: " " and a duplicate chain, which then collides with the real mode.
 const agentSelectionFields = {
-	agent: Type.Optional(Type.String({ description: "Named agent from the agents directory (exactly one of agent | systemPrompt | resume)" })),
-	systemPrompt: Type.Optional(Type.String({ description: "Inline system prompt / persona for an ad-hoc agent" })),
-	name: Type.Optional(Type.String({ description: "Display label for inline agents (shown in widget and approval prompts)" })),
-	model: Type.Optional(Type.String({ description: "Model override (provider/model-id)" })),
-	tools: Type.Optional(Type.String({ description: "Comma-separated tool allowlist for the agent (e.g. \"read,grep,find,ls\")" })),
-	thinking: Type.Optional(
-		StringEnum(["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const, {
-			description: "Thinking level for the agent. Default: inherits the configured subagent default, then Pi's child-process default.",
-		}),
-	),
-	resume: Type.Optional(Type.String({ description: "Session id of a previous subagent run to continue with full context" })),
+	agent: Type.Optional(Type.String({ description: "Named user or project agent (exactly one of agent | systemPrompt | resume)." })),
+	systemPrompt: Type.Optional(Type.String({ description: "Inline persona for an ad-hoc agent (exactly one of agent | systemPrompt | resume)." })),
+	name: Type.Optional(Type.String({ description: "Optional display label for a new inline agent." })),
+	model: Type.Optional(Type.String({ description: "Exact provider/model-id[:thinking-level]. Omit to inherit the configured or child-process default." })),
+	tools: Type.Optional(Type.String({ description: "Comma-separated tools the child may use. Omit to inherit the caller's active tools." })),
+	resume: Type.Optional(Type.String({ description: "Existing subagent session ID to continue with its history (exactly one of agent | systemPrompt | resume)." })),
 	forkContext: Type.Optional(
-		Type.String({ description: '"none" (default), "all", or a positive integer as a string, e.g. "5", meaning the last N turns' }),
+		Type.String({ description: 'Context to copy into a new agent: "none", "all", or a positive number of recent turns. Cannot be combined with resume.' }),
 	),
 	resultCapTokens: Type.Optional(
 		Type.Integer({
 			minimum: 0,
-			description:
-				"Override the result cap (approx. tokens) for this agent; 0 disables it. Falls back to the call-level value, then the configured default, then 1000.",
+			description: "Approximate token limit for the result returned to the caller. Use 0 for the full result.",
 		}),
 	),
 };
 
 const TaskItem = Type.Object({
 	...agentSelectionFields,
-	task: Type.String({ description: "Task to delegate to the agent" }),
+	task: Type.String({ description: "Instruction for the selected agent." }),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 });
 
 const ChainItem = Type.Object({
 	...agentSelectionFields,
-	task: Type.String({ description: "Task with optional {previous} placeholder for prior output" }),
+	task: Type.String({ description: "Instruction for this step; {previous} is replaced with the previous step's output." }),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 });
 
 const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
-	description: 'Which agent directories to use. Default: "user". Use "both" to include project-local agents.',
+	description: 'Which agent directories to search: "user" (default), "project", or "both".',
 	default: "user",
 });
 
 const SubagentParams = Type.Object({
 	...agentSelectionFields,
-	task: Type.Optional(Type.String({ description: "Task to delegate (for single mode)" })),
-	tasks: Type.Optional(Type.Array(TaskItem, { description: "Array of tasks for parallel execution" })),
-	chain: Type.Optional(Type.Array(ChainItem, { description: "Array of tasks for sequential execution" })),
-	agentScope: Type.Optional(AgentScopeSchema),
-	confirmProjectAgents: Type.Optional(
-		Type.Boolean({ description: "Prompt before running project-local agents. Default: true.", default: true }),
+	task: Type.Optional(Type.String({ description: "Instruction for the selected agent (single mode). Leave empty when using tasks or chain." })),
+	tasks: Type.Optional(
+		Type.Array(TaskItem, {
+			maxItems: MAX_PARALLEL_TASKS,
+			description: "Parallel mode: independent tasks with disjoint write scopes. Leave empty for single or chain mode.",
+		}),
 	),
-	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process (single mode)" })),
+	chain: Type.Optional(
+		Type.Array(ChainItem, {
+			description: "Chain mode: steps that run sequentially. Leave empty for single or parallel mode.",
+		}),
+	),
+	agentScope: Type.Optional(AgentScopeSchema),
+	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process." })),
 });
+
+/**
+ * Drop placeholder values before mode detection. Models that fill every schema
+ * property emit "", " ", or [] for the fields they do not intend to use, and a
+ * literal empty value must never register as an active mode or an agent source.
+ */
+export function sanitizeToolParams<T>(params: T): T {
+	if (Array.isArray(params)) {
+		return params.filter((item) => item !== null && item !== undefined).map((item) => sanitizeToolParams(item)) as T;
+	}
+	if (typeof params !== "object" || params === null) return params;
+	const clean: Record<string, unknown> = {};
+	for (const [key, value] of Object.entries(params as Record<string, unknown>)) {
+		if (value === null || value === undefined) continue;
+		if (typeof value === "string") {
+			const trimmed = value.trim();
+			if (trimmed) clean[key] = trimmed;
+			continue;
+		}
+		if (Array.isArray(value)) {
+			const items = sanitizeToolParams(value) as unknown[];
+			if (items.length > 0) clean[key] = items;
+			continue;
+		}
+		clean[key] = typeof value === "object" ? sanitizeToolParams(value) : value;
+	}
+	return clean as T;
+}
 
 function displayName(item: { agent?: string; name?: string; resume?: string }): string {
 	if (item.agent) return item.agent;
@@ -1106,9 +1259,8 @@ export function registerSubagentTool(pi: ExtensionAPI) {
 		budgetAcquireTimeoutMs: DEFAULT_BUDGET_ACQUIRE_TIMEOUT_MS,
 	};
 	const fileConfig = loadSubagentConfig();
-	// Keep session-scoped policy here, but deliberately do not capture
-	// defaultModel/defaultThinkingLevel. Those two values are command-controlled
-	// and are loaded inside execute() for every future call.
+	// Keep session-scoped policy here, but deliberately do not capture defaultModel.
+	// It is command-controlled and is loaded inside execute() for every future call.
 	const config = {
 		delegationPolicy: fileConfig.delegationPolicy,
 		resultCapTokens: fileConfig.resultCapTokens,
@@ -1120,32 +1272,31 @@ export function registerSubagentTool(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
+		promptSnippet: "Delegate a self-contained task to a separate Pi agent.",
 		description: [
-			"Delegate tasks to subagents with isolated context.",
-			"Agent persona: named agent (from agents dir), inline via systemPrompt (+ optional name/model/tools), or resume a previous session by id.",
-			"Modes: single (task), parallel (tasks array), chain (sequential with {previous} placeholder).",
-			"Each result includes a session id; pass it as `resume` with a follow-up task to continue that agent with full context (e.g. verify an implemented fix).",
-			`Named agents live in ${path.join(getAgentDir(), "agents")}; project-local agents in ${CONFIG_DIR_NAME}/agents require agentScope "both" or "project".`,
-			"Dangerous bash calls inside subagents surface as approval prompts to the user; write/edit follow the configured tool allowlist.",
+			"Run separate Pi subagents.",
+			"Choose one mode: single (`task`), parallel (`tasks`), or sequential (`chain`).",
+			"Each agent needs exactly one source: `agent`, `systemPrompt`, or `resume`.",
+			"In parallel and chain modes, configure each item independently.",
 		].join(" "),
-		promptGuidelines: [...OPERATIONAL_GUIDELINES, buildDelegationPolicyLine(config.delegationPolicy)],
+		promptGuidelines: [buildDelegationPolicyLine(config.delegationPolicy), ...OPERATIONAL_GUIDELINES],
 		parameters: SubagentParams,
 
-		async execute(toolCallId, params, signal, onUpdate, ctx) {
+		async execute(toolCallId, rawParams, signal, onUpdate, ctx) {
+			const params = sanitizeToolParams(rawParams);
 			const agentScope: AgentScope = params.agentScope ?? "user";
 			const discovery = discoverAgents(ctx.cwd, agentScope);
 			const agents = discovery.agents;
-			// Read these two command-controlled values for every tool call. This keeps
-			// /subagent-defaults effective immediately without freezing them at
-			// session_start, while the registry lookup prevents hand-edited unknown
-			// models from reaching a child process.
+			// Read command-controlled model policy values for every tool call. This keeps
+			// /subagent-defaults and hand-edited allowlists effective immediately without
+			// freezing them at session_start, while the registry lookup prevents unknown
+			// configured models from reaching a child process.
 			const liveConfig = loadSubagentConfig();
 			const resolutionDefaults = resolveSubagentDefaults(liveConfig, ctx.modelRegistry);
-			const resolve = (item: TaskItemInput, index: number) => resolveSpec(item, agents, index, resolutionDefaults);
+			const resolve = (item: TaskItemInput, index: number) =>
+				resolveSpec(item, agents, index, resolutionDefaults, ctx.modelRegistry);
 			const capFor = (item: { resultCapTokens?: number }) =>
 				resolveResultCap(item.resultCapTokens, params.resultCapTokens, config.resultCapTokens);
-			const confirmProjectAgents = params.confirmProjectAgents ?? true;
-
 			const hasChain = (params.chain?.length ?? 0) > 0;
 			const hasTasks = (params.tasks?.length ?? 0) > 0;
 			const hasSingle = Boolean(params.task && (params.agent || params.systemPrompt || params.resume));
@@ -1173,7 +1324,7 @@ export function registerSubagentTool(pi: ExtensionAPI) {
 				};
 			}
 
-			if ((agentScope === "project" || agentScope === "both") && confirmProjectAgents && ctx.hasUI) {
+			if (agentScope === "project" || agentScope === "both") {
 				const requestedAgentNames = new Set<string>();
 				if (params.chain) for (const step of params.chain) if (step.agent) requestedAgentNames.add(step.agent);
 				if (params.tasks) for (const t of params.tasks) if (t.agent) requestedAgentNames.add(t.agent);
@@ -1184,6 +1335,13 @@ export function registerSubagentTool(pi: ExtensionAPI) {
 					.filter((a): a is AgentConfig => a?.source === "project");
 
 				if (projectAgentsRequested.length > 0) {
+					if (!ctx.hasUI) {
+						return {
+							content: [{ type: "text", text: "Project-local agents require interactive approval and cannot run in headless mode." }],
+							details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
+							isError: true,
+						};
+					}
 					const names = projectAgentsRequested.map((a) => a.name).join(", ");
 					const dir = discovery.projectAgentsDir ?? "(unknown)";
 					const ok = await ctx.ui.confirm(

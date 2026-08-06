@@ -1,10 +1,9 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import {
-	canonicalModelReference,
+	canonicalModelSelection,
+	formatModelSelection,
 	getSubagentConfigPath,
-	isSubagentThinkingLevel,
 	loadSubagentConfig,
-	SUBAGENT_THINKING_LEVELS,
 	type SubagentConfig,
 	updateSubagentDefaults,
 } from "./config.ts";
@@ -12,22 +11,34 @@ import {
 export type SubagentDefaultsCommandAction =
 	| { kind: "show" }
 	| { kind: "set-model"; value: string }
-	| { kind: "set-thinking"; value: string }
-	| { kind: "clear"; field?: "model" | "thinking" }
+	| { kind: "clear"; field?: "model" }
 	| { kind: "interactive" }
 	| { kind: "invalid"; message: string };
 
-const TOP_LEVEL_COMMANDS = ["show", "status", "list", "model", "thinking", "clear", "reset"] as const;
-const CLEAR_FIELDS = ["model", "thinking"] as const;
-const NO_SCOPED_MODELS_WARNING =
-	"This session has no scoped models. Configure a session model scope with Pi's --models option or the enabledModels setting before using the model picker.";
+const TOP_LEVEL_COMMANDS = ["show", "status", "list", "model", "clear", "reset"] as const;
+const CLEAR_FIELDS = ["model"] as const;
+const NO_MODELS_WARNING = "No available models are configured for this Pi session.";
+
+type ModelLike = {
+	model: { provider: string; id: string };
+	thinkingLevel?: string;
+};
 
 type CompletionItem = { value: string; label: string };
 
-export function scopedModelReferences(
-	scopedModels: readonly { model: { provider: string; id: string } }[],
-): string[] {
-	return [...new Set(scopedModels.map((scoped) => `${scoped.model.provider}/${scoped.model.id}`))].sort();
+export function modelReferences(models: readonly ModelLike[]): string[] {
+	return [...new Set(
+		models.map(({ model, thinkingLevel }) => `${model.provider}/${model.id}${thinkingLevel ? `:${thinkingLevel}` : ""}`),
+	)].sort();
+}
+
+export function scopedModelReferences(scopedModels: readonly ModelLike[]): string[] {
+	return modelReferences(scopedModels);
+}
+
+function currentModelReferences(ctx: ExtensionCommandContext): string[] {
+	if (ctx.scopedModels.length > 0) return scopedModelReferences(ctx.scopedModels);
+	return modelReferences(ctx.modelRegistry.getAvailable().map((model) => ({ model })));
 }
 
 function completionItems(
@@ -40,11 +51,6 @@ function completionItems(
 	return matching.length > 0 ? matching.map(toItem) : null;
 }
 
-/**
- * Return completions whose values replace the complete argument text.
- * Scoped model references are supplied separately because Pi's completion callback
- * receives only the argument prefix, not an ExtensionCommandContext.
- */
 export function getSubagentDefaultsArgumentCompletions(
 	prefix: string,
 	modelReferences: readonly string[] = [],
@@ -59,19 +65,13 @@ export function getSubagentDefaultsArgumentCompletions(
 
 	const command = words[0].toLowerCase();
 	const argument = words.length > 1 ? words[1] : "";
-	if (command === "thinking") {
-		if (hasTrailingWhitespace && words.length > 1) return null;
-		const options = [...SUBAGENT_THINKING_LEVELS, "clear"];
-		return completionItems(options, argument, (value) => ({ value: `thinking ${value}`, label: value }));
-	}
 	if (command === "clear") {
 		if (hasTrailingWhitespace && words.length > 1) return null;
 		return completionItems(CLEAR_FIELDS, argument, (value) => ({ value: `clear ${value}`, label: value }));
 	}
 	if (command === "model") {
 		if (hasTrailingWhitespace && words.length > 1) return null;
-		const options = [...new Set([...modelReferences, "clear"])]
-			.sort((left, right) => left.localeCompare(right));
+		const options = [...new Set([...modelReferences, "clear"])].sort((left, right) => left.localeCompare(right));
 		return completionItems(options, argument, (value) => ({ value: `model ${value}`, label: value }));
 	}
 	return null;
@@ -90,31 +90,28 @@ export function parseSubagentDefaultsCommand(args: string): SubagentDefaultsComm
 	}
 	if (command === "clear" || command === "reset") {
 		if (words.length === 1) return { kind: "clear" };
-		if (words.length === 2 && (words[1] === "model" || words[1] === "thinking")) {
-			return { kind: "clear", field: words[1] };
-		}
-		return { kind: "invalid", message: "Use clear, clear model, or clear thinking." };
+		if (words.length === 2 && words[1] === "model") return { kind: "clear", field: "model" };
+		return { kind: "invalid", message: "Use clear or clear model." };
 	}
 	if (command === "model") {
-		if (words.length !== 2) return { kind: "invalid", message: "Usage: /subagent-defaults model <provider/model-id> (or model clear)." };
+		if (words.length !== 2) return { kind: "invalid", message: "Usage: /subagent-defaults model <provider/model-id[:thinking]> (or model clear)." };
 		return words[1].toLowerCase() === "clear" ? { kind: "clear", field: "model" } : { kind: "set-model", value: words[1] };
 	}
-	if (command === "thinking") {
-		if (words.length !== 2) return { kind: "invalid", message: "Usage: /subagent-defaults thinking <off|minimal|low|medium|high|xhigh|max> (or thinking clear)." };
-		return words[1].toLowerCase() === "clear" ? { kind: "clear", field: "thinking" } : { kind: "set-thinking", value: words[1].toLowerCase() };
-	}
-
 	return {
 		kind: "invalid",
-		message:
-			"Usage: /subagent-defaults [show|model <provider/model-id>|thinking <level>|clear [model|thinking]|reset].",
+		message: "Usage: /subagent-defaults [show|model <provider/model-id[:thinking]>|clear [model]|reset].",
 	};
 }
 
-export function formatSubagentDefaults(config: Pick<SubagentConfig, "defaultModel" | "defaultThinkingLevel">): string {
+export function formatSubagentDefaults(config: Pick<SubagentConfig, "defaultModel" | "allowedModels">): string {
+	const allowlist = config.allowedModels === undefined
+		? "(not configured)"
+		: config.allowedModels.length > 0
+			? config.allowedModels.map((entry) => formatModelSelection(entry)).join(", ")
+			: "(invalid or empty - resolution is blocked)";
 	return [
 		`Subagent default model: ${config.defaultModel ?? "(Pi child-process default)"}`,
-		`Subagent default thinking: ${config.defaultThinkingLevel ?? "(Pi child-process default)"}`,
+		`Subagent model allowlist: ${allowlist}`,
 		`Config: ${getSubagentConfigPath()}`,
 	].join("\n");
 }
@@ -125,82 +122,53 @@ function notify(ctx: ExtensionCommandContext, message: string, type: "info" | "w
 }
 
 async function setModel(ctx: ExtensionCommandContext, reference: string): Promise<void> {
-	const canonical = canonicalModelReference(reference, ctx.modelRegistry);
+	if (loadSubagentConfig().allowedModels !== undefined) {
+		notify(ctx, "Subagent model allowlist is active; edit allowedModels instead of defaultModel.", "warning");
+		return;
+	}
+	const canonical = canonicalModelSelection(reference, ctx.modelRegistry);
 	if (!canonical) {
-		notify(ctx, `Unknown model "${reference}". Use an exact provider/model-id from Pi's current model registry.`, "error");
+		notify(ctx, `Unknown model "${reference}". Use an exact provider/model-id[:thinking] from Pi's current model registry.`, "error");
 		return;
 	}
-	const result = await updateSubagentDefaults({ defaultModel: canonical });
+	const canonicalReference = formatModelSelection(canonical);
+	const result = await updateSubagentDefaults({ defaultModel: canonicalReference });
 	if (!result.ok) {
 		notify(ctx, result.error, "error");
 		return;
 	}
-	notify(ctx, `Subagent default model set to ${canonical}. The main agent model was not changed.`, "info");
+	notify(ctx, `Subagent default model set to ${canonicalReference}. The main agent model was not changed.`, "info");
 }
 
-async function setThinking(ctx: ExtensionCommandContext, value: string): Promise<void> {
-	if (!isSubagentThinkingLevel(value)) {
-		notify(ctx, `Unknown thinking level "${value}". Use ${SUBAGENT_THINKING_LEVELS.join(" | ")}.`, "error");
-		return;
-	}
-	const result = await updateSubagentDefaults({ defaultThinkingLevel: value });
+async function clearDefaults(ctx: ExtensionCommandContext): Promise<void> {
+	const result = await updateSubagentDefaults({ defaultModel: null });
 	if (!result.ok) {
 		notify(ctx, result.error, "error");
 		return;
 	}
-	notify(ctx, `Subagent default thinking set to ${value}.`, "info");
-}
-
-async function clearDefaults(ctx: ExtensionCommandContext, field?: "model" | "thinking"): Promise<void> {
-	const patch = field === "model"
-		? { defaultModel: null }
-		: field === "thinking"
-			? { defaultThinkingLevel: null }
-			: { defaultModel: null, defaultThinkingLevel: null };
-	const result = await updateSubagentDefaults(patch);
-	if (!result.ok) {
-		notify(ctx, result.error, "error");
-		return;
-	}
-	const target = field ? `Subagent default ${field} cleared.` : "Subagent model and thinking defaults cleared.";
-	notify(ctx, target, "info");
+	notify(ctx, "Subagent default model cleared.", "info");
 }
 
 async function interactive(ctx: ExtensionCommandContext): Promise<void> {
 	const choice = await ctx.ui.select("Subagent defaults", [
 		"Show current values",
 		"Set default model",
-		"Set default thinking level",
 		"Clear default model",
-		"Clear default thinking level",
-		"Reset both defaults",
+		"Reset default model",
 	]);
 	if (!choice) return;
 	if (choice === "Show current values") {
 		notify(ctx, formatSubagentDefaults(loadSubagentConfig()));
 		return;
 	}
-	if (choice === "Clear default model") {
-		await clearDefaults(ctx, "model");
-		return;
-	}
-	if (choice === "Clear default thinking level") {
-		await clearDefaults(ctx, "thinking");
-		return;
-	}
-	if (choice === "Reset both defaults") {
+	if (choice === "Clear default model" || choice === "Reset default model") {
 		await clearDefaults(ctx);
 		return;
 	}
-	if (choice === "Set default thinking level") {
-		const level = await ctx.ui.select("Default subagent thinking level", [...SUBAGENT_THINKING_LEVELS]);
-		if (level) await setThinking(ctx, level);
-		return;
-	}
 
-	const models = scopedModelReferences(ctx.scopedModels);
+	const models = currentModelReferences(ctx);
 	if (models.length === 0) {
-		notify(ctx, NO_SCOPED_MODELS_WARNING, "warning");
+		notify(ctx, NO_MODELS_WARNING, "warning");
 		return;
 	}
 	const model = await ctx.ui.select("Default subagent model", models);
@@ -222,27 +190,21 @@ export async function handleSubagentDefaultsCommand(args: string, ctx: Extension
 		await setModel(ctx, action.value);
 		return;
 	}
-	if (action.kind === "set-thinking") {
-		await setThinking(ctx, action.value);
-		return;
-	}
 	if (action.kind === "clear") {
-		await clearDefaults(ctx, action.field);
+		await clearDefaults(ctx);
 		return;
 	}
 	notify(ctx, action.message, "error");
 }
 
 export function registerSubagentDefaultsCommand(pi: ExtensionAPI): void {
-	let scopedModelSnapshot: string[] = [];
+	let modelSnapshot: string[] = [];
 	pi.on("session_start", (_event, ctx) => {
-		scopedModelSnapshot = scopedModelReferences(ctx.scopedModels);
+		modelSnapshot = currentModelReferences(ctx);
 	});
 	pi.registerCommand("subagent-defaults", {
-		description: "Show or configure model and thinking defaults for future subagent calls",
-		getArgumentCompletions: (prefix) =>
-			getSubagentDefaultsArgumentCompletions(prefix, scopedModelSnapshot),
+		description: "Show or configure the subagent model default",
+		getArgumentCompletions: (prefix) => getSubagentDefaultsArgumentCompletions(prefix, modelSnapshot),
 		handler: handleSubagentDefaultsCommand,
 	});
 }
-

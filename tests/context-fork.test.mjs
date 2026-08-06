@@ -137,9 +137,43 @@ test("applyForkContext returns the large fork warning", async () => {
   }
 });
 
-test("resolveSpec rejects resume with forkContext", () => {
-  const result = resolveSpec({ resume: "session-1", forkContext: "all", task: "continue" }, [], 0);
+test("resolveSpec ignores forkContext placeholders on a resume call", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "subagent-resume-"));
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = dir;
+  try {
+    const sessionsDir = path.join(dir, "subagent-sessions");
+    fs.mkdirSync(sessionsDir, { recursive: true });
+    fs.writeFileSync(path.join(sessionsDir, "session-1.jsonl"), "");
+    fs.writeFileSync(path.join(sessionsDir, "session-1.meta.json"), JSON.stringify({ name: "prior", systemPrompt: "prior" }));
+
+    const result = resolveSpec({ resume: "session-1", forkContext: "all", task: "continue" }, [], 0);
+
+    assert.ok("spec" in result);
+    assert.equal(result.spec.isResume, true);
+    assert.deepEqual(result.spec.forkContext, { mode: "none" });
+  } finally {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("resolveSpec falls back to the inline persona when placeholder fields are filled", () => {
+  const result = resolveSpec(
+    { agent: "general", resume: " ", systemPrompt: "You are a helper", name: "helper", task: "work" },
+    [],
+    0,
+  );
+
+  assert.ok("spec" in result);
+  assert.equal(result.spec.source, "inline");
+  assert.equal(result.spec.name, "helper");
+});
+
+test("resolveSpec still reports an unknown named agent when no inline persona is given", () => {
+  const result = resolveSpec({ agent: "general", task: "work" }, [], 0);
 
   assert.ok("error" in result);
-  assert.match(result.error, /mutually exclusive/);
+  assert.match(result.error, /Unknown agent/);
 });
