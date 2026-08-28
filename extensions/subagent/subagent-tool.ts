@@ -66,6 +66,8 @@ import { inheritedToolsEnv } from "./inherited-tools.ts";
 import { capText, formatEnvelope, resolveResultCap } from "./result-cap.ts";
 import {
 	DEFAULT_BACKGROUND_WAIT_TIMEOUT_MS,
+	abortBackgroundRun,
+	discardBackgroundRun,
 	getBackgroundRun,
 	listBackgroundRuns,
 	markBackgroundRunCollected,
@@ -76,6 +78,7 @@ import {
 } from "./background-runs.ts";
 import { type ApprovalServer, startApprovalServer } from "./approval-server.ts";
 import { displayModel, modelTag } from "./terminal-display.ts";
+import { getSubagentPanel, type SubagentPanelSink } from "./subagent-panel.ts";
 import { writeOutputArtifact } from "./output-artifact.ts";
 
 const COLLAPSED_ITEM_COUNT = 10;
@@ -132,7 +135,8 @@ function formatToolCall(
 	switch (toolName) {
 		case "bash": {
 			const command = (args.command as string) || "...";
-			const preview = command.length > 60 ? `${command.slice(0, 60)}...` : command;
+			const compactCommand = command.replace(/\s+/g, " ");
+			const preview = compactCommand.length > 60 ? `${compactCommand.slice(0, 60)}...` : compactCommand;
 			return themeFg("muted", "$ ") + themeFg("toolOutput", preview);
 		}
 		case "read": {
@@ -491,6 +495,7 @@ export function resolveSpec(
 			model: item.model ?? meta.model,
 			tools: parseToolsList(item.tools) ?? meta.tools,
 			thinking: meta.thinking,
+			cwd: meta.cwd,
 			source: "resume",
 			sessionId,
 			sessionFile,
@@ -690,7 +695,7 @@ function getPiInvocation(args: string[]): { command: string; args: string[] } {
 }
 
 export interface WidgetTracker {
-	add(key: string, name: string, model?: string): void;
+	add(key: string, name: string, model?: string, task?: string): void;
 	setModel(key: string, model: string): void;
 	setTool(key: string, tool: string | undefined): void;
 	setUsage(key: string, usage: UsageStats): void;
@@ -703,6 +708,7 @@ export function createWidgetTracker(
 	ctx: { hasUI: boolean; ui: { setWidget(id: string, lines?: string[]): void } },
 	widgetId = WIDGET_ID_PREFIX,
 	nestedReporter?: (nestedCount: number) => void,
+	panel?: SubagentPanelSink,
 ): WidgetTracker {
 	interface Row {
 		name: string;
@@ -715,11 +721,12 @@ export function createWidgetTracker(
 	const rows = new Map<string, Row>();
 
 	const render = () => {
-		if (!ctx.hasUI) return;
+		if (panel || !ctx.hasUI) return;
 		const lines = [...rows.values()].map((row) => {
 			const icon = row.status === "running" ? "⏳" : row.status === "done" ? "✓" : "✗";
 			const tool = row.currentTool ? ` · ${row.currentTool}` : "";
-			const usage = ` · ↑${formatTokens(row.usage.input)} ↓${formatTokens(row.usage.output)} · ${row.usage.turns}t`;
+			const cost = row.usage.cost > 0 ? ` · $${row.usage.cost.toFixed(4)}` : "";
+			const usage = ` · ↑${formatTokens(row.usage.input)} ↓${formatTokens(row.usage.output)} · ${row.usage.turns}t${cost}`;
 			const nested = row.nestedCount > 0 ? ` · +${row.nestedCount} nested` : "";
 			return ` ${icon} ${row.name} ${modelTag(row.model)}${tool}${usage}${nested}`;
 		});
@@ -737,8 +744,18 @@ export function createWidgetTracker(
 	});
 
 	return {
-		add(key, name, model) {
+		add(key, name, model, task) {
 			rows.set(key, { name, model: displayModel(model), status: "running", usage: emptyUsage(), nestedCount: 0 });
+			panel?.add({
+				id: key,
+				sessionId: key,
+				name,
+				model,
+				status: "running",
+				task,
+				startedAt: Date.now(),
+				usage: emptyUsage(),
+			});
 			nestedReporter?.([...rows.values()].filter((row) => row.status === "running").length);
 			render();
 		},
@@ -746,24 +763,28 @@ export function createWidgetTracker(
 			const row = rows.get(key);
 			if (!row) return;
 			row.model = model;
+			panel?.update(key, { model });
 			render();
 		},
 		setTool(key, tool) {
 			const row = rows.get(key);
 			if (!row) return;
 			row.currentTool = tool;
+			panel?.update(key, { tool: tool?.replace(/\s+/g, " ") });
 			render();
 		},
 		setUsage(key, usage) {
 			const row = rows.get(key);
 			if (!row) return;
 			row.usage = usage;
+			panel?.update(key, { usage });
 			render();
 		},
 		setNestedCount(key, nestedCount) {
 			const row = rows.get(key);
 			if (!row) return;
 			row.nestedCount = Math.max(0, nestedCount);
+			panel?.update(key, { nestedCount: row.nestedCount });
 			render();
 		},
 		finish(key, ok) {
@@ -771,13 +792,15 @@ export function createWidgetTracker(
 			if (!row) return;
 			row.status = ok ? "done" : "failed";
 			row.currentTool = undefined;
+			panel?.finish(key);
+			rows.delete(key);
 			nestedReporter?.([...rows.values()].filter((item) => item.status === "running").length);
 			render();
 		},
 		clear() {
 			rows.clear();
 			nestedReporter?.(0);
-			if (ctx.hasUI) ctx.ui.setWidget(widgetId, undefined);
+			if (ctx.hasUI && !panel) ctx.ui.setWidget(widgetId, undefined);
 		},
 	};
 }
@@ -1023,7 +1046,7 @@ export async function runSingleAgent(
 			releaseSlot = slot.release;
 		}
 
-		widget.add(spec.sessionId, spec.name, spec.model);
+		widget.add(spec.sessionId, spec.name, spec.model, task);
 
 		if (!spec.isResume) {
 			writeSessionMeta(spec, cwd ?? defaultCwd);
@@ -1305,8 +1328,65 @@ export function registerSubagentTool(pi: ExtensionAPI) {
 		...(registrationDepth > 0 ? treePolicyFromEnv(process.env, defaultTreePolicy) : {}),
 	};
 
-	// Register the collector first so simple registration stubs that retain only
-	// the last definition still observe the primary subagent tool.
+	pi.registerTool({
+		name: "subagent_stop",
+		label: "Stop Subagent",
+		promptSnippet: "Stop a running background subagent by session id.",
+		description: [
+			"Stop a running background subagent started with `async: true`.",
+			"Pass the session id returned by `subagent`.",
+			"The child process is aborted, but its session remains resumable and its aborted result can still be collected with `subagent_wait`.",
+		].join(" "),
+		parameters: Type.Object({
+			id: Type.String({ description: "Running background subagent session id returned by subagent." }),
+		}),
+
+		async execute(_toolCallId, rawParams) {
+			const params = sanitizeToolParams(rawParams ?? {});
+			const sessionId = typeof params.id === "string" ? params.id.trim() : "";
+			if (!sessionId) {
+				return {
+					content: [{ type: "text", text: "A non-empty background subagent session id is required." }],
+					details: backgroundDetails([]),
+					isError: true,
+				};
+			}
+			const run = getBackgroundRun(sessionId);
+			if (!run) {
+				return {
+					content: [{ type: "text", text: `Unknown background subagent session "${sessionId}". Known runs: ${formatBackgroundRuns(listBackgroundRuns())}.` }],
+					details: backgroundDetails([]),
+					isError: true,
+				};
+			}
+			if (run.status !== "running") {
+				return {
+					content: [{ type: "text", text: `Background subagent "${run.agent}" is already ${run.status}.` }],
+					details: backgroundDetails([]),
+				};
+			}
+			if (run.stopRequested) {
+				return {
+					content: [{ type: "text", text: `Stop already requested for background subagent "${run.agent}" (session: ${sessionId}).` }],
+					details: backgroundDetails([]),
+				};
+			}
+			if (!abortBackgroundRun(sessionId)) {
+				return {
+					content: [{ type: "text", text: `Could not stop background subagent "${run.agent}" (${sessionId}).` }],
+					details: backgroundDetails([]),
+					isError: true,
+				};
+			}
+			return {
+				content: [{ type: "text", text: `Stop requested for background subagent "${run.agent}" (session: ${sessionId}). Use subagent_wait with id "${sessionId}" to collect the aborted result.` }],
+				details: backgroundDetails([]),
+			};
+		},
+	});
+
+	// Register the collector after stop control so both operations are available
+	// before the primary delegation tool in simple registration stubs.
 	pi.registerTool({
 		name: "subagent_wait",
 		label: "Wait for Subagents",
@@ -1436,15 +1516,23 @@ export function registerSubagentTool(pi: ExtensionAPI) {
 			let approvalServer: ApprovalServer | null = null;
 			let ownsCoordinator = false;
 			let coordinatorSocketPath: string | undefined = inheritedCoordinatorSocket;
+			const panel = ctx.mode === "tui" && ctx.hasUI ? getSubagentPanel() : undefined;
 			const widget = createWidgetTracker(ctx, `${WIDGET_ID_PREFIX}:${toolCallId}`, (nestedCount) => {
 				const selfSessionId = process.env.PI_SUBAGENT_SESSION_ID;
 				if (!ownsCoordinator && coordinatorSocketPath && selfSessionId) {
 					sendStatusCount(coordinatorSocketPath, selfSessionId, nestedCount);
 				}
-			});
+			}, panel);
 			if (!inheritedCoordinatorSocket && currentDepth === 0 && (ctx.hasUI || config.maxDepth > 1)) {
 				approvalServer = startApprovalServer(
-					{ select: ctx.hasUI ? (title, options) => ctx.ui.select(title, options) : undefined },
+					{
+						select: ctx.hasUI
+							? async (title, options) => {
+								getSubagentPanel()?.exitPanelMode();
+								return ctx.ui.select(title, options);
+							}
+							: undefined,
+					},
 					{
 						maxLiveChildren: config.maxLiveChildren,
 						acquireTimeoutMs: config.budgetAcquireTimeoutMs,
@@ -1456,7 +1544,7 @@ export function registerSubagentTool(pi: ExtensionAPI) {
 			}
 			let forkSourceMessages: ReturnType<typeof buildForkSourceMessages> | undefined;
 			const prepareFork = async (spec: AgentSpec, cwd: string | undefined) => {
-				spec.cwd = cwd ?? ctx.cwd;
+				spec.cwd = cwd ?? spec.cwd ?? ctx.cwd;
 				if (spec.forkContext.mode === "none") return;
 				forkSourceMessages ??= buildForkSourceMessages(ctx.sessionManager);
 				const forkResult = await applyForkContext(spec, spec.forkContext, ctx.sessionManager, forkSourceMessages);
@@ -1485,6 +1573,7 @@ export function registerSubagentTool(pi: ExtensionAPI) {
 						isError: true,
 					};
 				}
+				if (resolved.spec.isResume && !params.async && existing) discardBackgroundRun(existing.sessionId);
 				await prepareFork(resolved.spec, params.cwd);
 
 				if (params.async) {
@@ -1494,7 +1583,7 @@ export function registerSubagentTool(pi: ExtensionAPI) {
 						ctx.cwd,
 						resolved.spec,
 						params.task,
-						params.cwd,
+						params.cwd ?? resolved.spec.cwd,
 						controller.signal,
 						undefined,
 						makeDetails,
@@ -1532,6 +1621,7 @@ export function registerSubagentTool(pi: ExtensionAPI) {
 						task: params.task,
 						promise: backgroundPromise,
 						resultCapTokens: resultCap,
+						replaceSettled: resolved.spec.isResume,
 						abort: () => controller.abort(),
 					});
 					return {
@@ -1547,7 +1637,7 @@ export function registerSubagentTool(pi: ExtensionAPI) {
 					ctx.cwd,
 					resolved.spec,
 					params.task,
-					params.cwd,
+					params.cwd ?? resolved.spec.cwd,
 					signal,
 					onUpdate,
 					makeDetails,

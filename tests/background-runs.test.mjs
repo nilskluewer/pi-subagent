@@ -2,11 +2,13 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  abortBackgroundRun,
   clearBackgroundRuns,
   getBackgroundRun,
   listBackgroundRuns,
   markBackgroundRunCollected,
   registerBackgroundRun,
+  subscribeBackgroundRuns,
   waitForAllBackgroundRuns,
   waitForBackgroundRun,
   waitForFirstBackgroundRun,
@@ -61,6 +63,54 @@ test("registers a running background run with its metadata and promise", async (
   pending.resolve(result());
   await run.promise;
   assert.equal(run.status, "done");
+});
+
+test("replaces a settled record when a resumable session starts a new background run", async () => {
+  const first = registerBackgroundRun({
+    sessionId: "resume-me",
+    agent: "worker",
+    task: "first",
+    promise: Promise.resolve(result({ sessionId: "resume-me" })),
+  });
+  await first.promise;
+
+  const second = registerBackgroundRun({
+    sessionId: "resume-me",
+    agent: "worker",
+    task: "follow-up",
+    promise: Promise.resolve(result({ sessionId: "resume-me", task: "follow-up" })),
+    replaceSettled: true,
+  });
+
+  assert.notEqual(second, first);
+  assert.equal(getBackgroundRun("resume-me"), second);
+  assert.equal(second.task, "follow-up");
+  await second.promise;
+});
+
+test("publishes background lifecycle events without allowing observers to break runs", async () => {
+  const pending = deferred();
+  const events = [];
+  const unsubscribe = subscribeBackgroundRuns((event) => {
+    events.push(event.type);
+    throw new Error("observer failure");
+  });
+
+  const run = registerBackgroundRun({
+    sessionId: "events",
+    agent: "worker",
+    task: "observe",
+    promise: pending.promise,
+    abort() {
+      pending.resolve(result({ sessionId: "events", exitCode: 1, stopReason: "aborted" }));
+    },
+  });
+
+  assert.equal(abortBackgroundRun(run.sessionId), true);
+  await run.promise;
+  unsubscribe();
+  assert.deepEqual(events, ["registered", "stopRequested", "settled"]);
+  assert.equal(run.status, "failed");
 });
 
 test("a waiter started before settlement resolves from the run's deferred promise", async () => {

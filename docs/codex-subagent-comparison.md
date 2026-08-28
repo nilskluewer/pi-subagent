@@ -7,7 +7,7 @@ Codex ships two generations: **V1** (`multi_agent` feature, stable, default-on) 
 
 **pi-subagent combines one-task delegation with collectable background runs. Codex is asynchronous collaboration.**
 
-A `subagent` call delegates one task and blocks by default; `async: true` starts it in the background and `subagent_wait` collects the result.
+A `subagent` call delegates one task and blocks by default; `async: true` starts it in the background, `subagent_stop` aborts it by session id, and `subagent_wait` collects the result.
 Codex `spawn_agent` returns immediately with a handle; the parent model is explicitly instructed to keep doing "meaningful non-overlapping work" while children run, and only calls `wait_agent` when truly blocked.
 Results arrive asynchronously as mailbox messages (`FINAL_ANSWER` envelopes) injected into the parent context at message boundaries.
 
@@ -18,7 +18,7 @@ Everything else follows from that: Codex needs mailboxes, `list_agents`, `interr
 | Dimension | pi-subagent | Codex |
 |---|---|---|
 | Execution model | Separate `pi --mode json -p` child **processes**; JSONL event stream | In-process **Tokio sessions** in one process; shared ThreadManager, auth, MCP, skills services; root-scoped `AgentControl` actor registry |
-| Tool surface | One `subagent` tool for one task per call + `subagent_wait` for background results | Tool family: `spawn_agent`, `send_message`, `followup_task`, `wait_agent`, `interrupt_agent`, `list_agents` (V2, namespace `collaboration`); V1 adds `send_input`, `close_agent`, `resume_agent` |
+| Tool surface | One `subagent` tool for one task per call + `subagent_stop` + `subagent_wait` for background runs | Tool family: `spawn_agent`, `send_message`, `followup_task`, `wait_agent`, `interrupt_agent`, `list_agents` (V2, namespace `collaboration`); V1 adds `send_input`, `close_agent`, `resume_agent` |
 | Blocking vs async | Blocking by default; `async: true` returns immediately and `subagent_wait` collects the result | Fire-and-forget spawn; async mailbox delivery of final answers; explicit wait only when blocked |
 | Parallelism | Independent `subagent` calls can run concurrently, with one task in each call | V2: 4 concurrent threads default **including root** (so 3 children); execution limiter + residency limiter with LRU unloading of idle agents |
 | Nesting depth | Hard block: subagents cannot spawn grandchildren | V1: configurable `max_depth` (default 1); V2: **unlimited depth**, bounded only by the shared concurrency limiter |
@@ -30,7 +30,7 @@ Everything else follows from that: Codex needs mailboxes, `list_agents`, `interr
 | Permissions | Shared gate; dangerous bash proxied over Unix socket to parent TUI, labeled per agent, serialized prompts | Children inherit parent's approval policy, permission profile, cwd, exec policy; delegate path (review/guardian) routes approvals to parent session; children **cannot call `request_user_input`** (root-only) |
 | Delegation policy | Tool description + skill text ("only when explicitly invoked") | Injected `<multi_agent_mode>` developer fragment: `ExplicitRequestOnly` (default), `Proactive` (auto-activated at `ultra` reasoning effort), or custom text (400-token cap); rendered last so it overrides earlier hints |
 | Model-visible state | None (widget is UI-only; parent blocks anyway) | World-state system: `<environment_context>` continuously lists open child agents; status changes arrive as notifications; `list_agents` for on-demand snapshots |
-| UI | Live widget rows above editor (status, model, tool, tokens, turns); Ctrl+O streams child output | Thread-navigation model: `/agents` picker, Alt+Left/Right to switch into a child thread; compact history cells on parent transcript; bounded "Sub-agents running" activity feed; no side-by-side dashboard |
+| UI | Live subagent panel above editor (status, model, tool, elapsed time, tokens, turns, tasks, costs, nested counts); finished rows disappear immediately; `F8` focuses it (`Fn+F8` on MacBooks when needed, and `/subagent-panel` is a fallback), arrows select, and `x` stops a background run; Ctrl+O still streams child output | Thread-navigation model: `/agents` picker, Alt+Left/Right to switch into a child thread; compact history cells on parent transcript; bounded "Sub-agents running" activity feed; no side-by-side dashboard |
 | Cheap chores | No separate cheap-task tool; use one `subagent` call with an inline persona | No equivalent |
 | Specialized delegates | Handled via personas/skills | `/review` and Guardian approval-review run through a separate `codex_delegate` path: own prompt, `AskForApproval::Never`, web search and sub-spawning disabled |
 
@@ -42,7 +42,7 @@ Everything else follows from that: Codex needs mailboxes, `list_agents`, `interr
 2. **Live result collection.**
    `subagent_wait` gives the parent an explicit way to collect background work by session id.
 3. **Collectable background runs.**
-   `async: true` keeps the parent responsive while `subagent_wait` collects a result from the current session.
+   `async: true` keeps the parent responsive while `subagent_stop` can abort a run and `subagent_wait` collects its final result from the current session.
 4. **Process isolation.**
    A crashing/hanging child cannot take down the parent; Codex agents share one process and runtime.
 5. **Simplicity.**
@@ -92,7 +92,7 @@ We store flat `<id>.meta.json` files; adding a `parent` field would enable tree-
 ### 7. Interrupt as a first-class, non-destructive operation
 
 Codex's `interrupt_agent` stops the current turn but keeps the agent alive for follow-ups.
-Our abort story (session id + last 10 messages) is decent, but "interrupted agents remain addressable" is a cleaner contract than "aborted, please resume."
+Our `subagent_stop` kills the isolated child process, preserves its session id, and lets the parent resume it later with the existing recovery context.
 
 ## Things to deliberately not copy
 

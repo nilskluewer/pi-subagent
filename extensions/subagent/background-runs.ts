@@ -2,6 +2,11 @@ import type { SingleResult } from "./subagent-tool.ts";
 
 export type BackgroundRunStatus = "running" | "done" | "failed";
 
+export type BackgroundRunEvent =
+	| { type: "registered"; run: BackgroundRun }
+	| { type: "stopRequested"; run: BackgroundRun }
+	| { type: "settled"; run: BackgroundRun };
+
 export interface BackgroundRun {
 	sessionId: string;
 	agent: string;
@@ -11,6 +16,7 @@ export interface BackgroundRun {
 	result?: SingleResult;
 	resultCapTokens?: number;
 	promise: Promise<SingleResult>;
+	stopRequested: boolean;
 	abort?: () => void;
 	/** Set once a wait call has handed this result to the caller. */
 	collectedAt?: number;
@@ -32,6 +38,8 @@ export interface RegisterBackgroundRunOptions {
 	promise: Promise<SingleResult>;
 	resultCapTokens?: number;
 	startedAt?: number;
+	/** Replace a terminal record when resuming the same session. Running records are never replaced. */
+	replaceSettled?: boolean;
 	abort?: () => void;
 	failureResult?: (error: unknown) => SingleResult;
 }
@@ -39,8 +47,24 @@ export interface RegisterBackgroundRunOptions {
 export const DEFAULT_BACKGROUND_WAIT_TIMEOUT_MS = 10 * 60 * 1000;
 
 const runs = new Map<string, BackgroundRun>();
+const listeners = new Set<(event: BackgroundRunEvent) => void>();
 const settlementTimes = new WeakMap<BackgroundRun, number>();
 const completionResolvers = new WeakMap<BackgroundRun, (result: SingleResult) => void>();
+
+export function subscribeBackgroundRuns(listener: (event: BackgroundRunEvent) => void): () => void {
+	listeners.add(listener);
+	return () => listeners.delete(listener);
+}
+
+function emit(event: BackgroundRunEvent): void {
+	for (const listener of listeners) {
+		try {
+			listener(event);
+		} catch {
+			// Observers must never change background-run lifecycle behaviour.
+		}
+	}
+}
 
 function isFailedResult(result: SingleResult): boolean {
 	return result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
@@ -85,13 +109,15 @@ function settle(
 	settlementTimes.set(record, Date.now());
 	const resolveCompletion = completionResolvers.get(record);
 	completionResolvers.delete(record);
+	emit({ type: "settled", run: record });
 	resolveCompletion?.(result);
 	return record;
 }
 
 export function registerBackgroundRun(options: RegisterBackgroundRunOptions): BackgroundRun {
 	const existing = runs.get(options.sessionId);
-	if (existing) return existing;
+	if (existing && (existing.status === "running" || !options.replaceSettled)) return existing;
+	if (existing) runs.delete(options.sessionId);
 
 	let resolveCompletion!: (result: SingleResult) => void;
 	const completion = new Promise<SingleResult>((resolve) => {
@@ -105,6 +131,7 @@ export function registerBackgroundRun(options: RegisterBackgroundRunOptions): Ba
 		status: "running",
 		resultCapTokens: options.resultCapTokens,
 		promise: completion,
+		stopRequested: false,
 		abort: options.abort,
 	};
 	completionResolvers.set(record, resolveCompletion);
@@ -124,11 +151,20 @@ export function registerBackgroundRun(options: RegisterBackgroundRunOptions): Ba
 		},
 	);
 	runs.set(record.sessionId, record);
+	emit({ type: "registered", run: record });
 	return record;
 }
 
 export function getBackgroundRun(sessionId: string): BackgroundRun | undefined {
 	return runs.get(sessionId);
+}
+
+/** Remove a terminal record before a synchronous resume starts a new run. */
+export function discardBackgroundRun(sessionId: string): boolean {
+	const record = runs.get(sessionId);
+	if (!record || record.status === "running") return false;
+	runs.delete(sessionId);
+	return true;
 }
 
 export function listBackgroundRuns(): BackgroundRun[] {
@@ -284,10 +320,14 @@ export function waitForAllBackgroundRuns(timeoutMs?: number, signal?: AbortSigna
 export function abortBackgroundRun(sessionId: string): boolean {
 	const record = runs.get(sessionId);
 	if (!record || record.status !== "running" || !record.abort) return false;
+	if (record.stopRequested) return true;
 	try {
+		record.stopRequested = true;
 		record.abort();
+		emit({ type: "stopRequested", run: record });
 		return true;
 	} catch {
+		record.stopRequested = false;
 		return false;
 	}
 }

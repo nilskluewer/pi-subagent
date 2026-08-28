@@ -10,6 +10,8 @@ One subagent extension for Pi that covers exactly what a multi-agent workflow ne
   Emit several `subagent` calls in the same assistant turn for independent parallel work.
   Call again with the previous result when work depends on an earlier task.
 - **`subagent_wait` tool** - collect results from background calls started with `async: true`.
+- **`subagent_stop` tool** - stop a running background subagent by session id while keeping its session resumable.
+- **`/subagent-stop <session-id>` command** - stop a background subagent from the Pi UI.
 - **Inline-first personas** - pass `systemPrompt` (+ optional `name`, `model`, and `tools`)
   directly in the tool call. Use `model` as `provider/model-id[:thinking-level]`.
   Skills define personas in their own text; no agent files are needed.
@@ -22,10 +24,16 @@ One subagent extension for Pi that covers exactly what a multi-agent workflow ne
   (e.g. reviewer proposes a fix → main agent implements → `resume` the reviewer to verify).
   If a run is aborted, the parent receives the session id, stop reason, and last 10 completed
   assistant messages/tool calls so it can inspect the working tree and resume intelligently.
-- **Live widget** - per-agent row above the editor: status, model, current tool, tokens, and
-  turns. The configured model is visible immediately; `default` is shown until an inherited
-  model resolves. Completed subagent views also show each model.
+- **Live subagent panel** - running rows above the editor: status, model, current tool,
+  elapsed time, tokens, turns, task, cost, and nested-child counts. The configured model is visible
+  immediately; `default` is shown until an inherited model resolves. Rows disappear as soon as
+  the subagent finishes, so completed runs do not accumulate in the statusbar.
+  Press `F8` to focus the panel, then use the arrow keys to select a row. On MacBooks,
+  use `Fn+F8` when the function row is configured for media controls. `/subagent-panel` is a command
+  fallback. Press `x` to stop the selected background run and `Escape` to return to the editor.
   Press Ctrl+O on the running tool call to inspect streaming output.
+  Completed sessions remain resumable through the `resume` parameter. A child that is already
+  running cannot receive new input through the current JSON launcher.
 - **Nested delegation with a root budget** - by default, depth-1 subagents can spawn one
   more level of subagents (`maxDepth: 2`). A root-scoped coordinator enforces a default
   tree-wide limit of 4 live child processes. Set `maxDepth: 1` to restore the old hard
@@ -234,9 +242,14 @@ For dependent work, call again with the previous result or pass a returned sessi
 
 Set `async` to `true` to start a subagent without blocking the parent turn.
 The async response names the agent and session id, and instructs the parent to call `subagent_wait` with that id.
+Call `subagent_stop` with that id to abort a running background child without deleting its resumable session.
+Use `/subagent-stop <session-id>` to stop the same run from the Pi UI. In the interactive TUI,
+`F8` focuses the subagent panel (`Fn+F8` on MacBooks when needed).
+The `/subagent-panel` command is a terminal-independent fallback. Arrow keys select a running row
+and `x` requests a stop. Finished rows disappear immediately.
 Call `subagent_wait` with `all: true` to collect every tracked run, omit `id` to collect the first run to finish, or pass `timeoutMs` to bound the wait.
 Background runs are tracked and collectable only during the current Pi session.
-A timeout reports still-running session ids without cancelling their child processes.
+A timeout or an aborted wait reports still-running session ids without cancelling their child processes.
 Completed and failed results remain available for repeated collection by session id during the current session.
 Session shutdown aborts running children and forgets the background-run registry.
 

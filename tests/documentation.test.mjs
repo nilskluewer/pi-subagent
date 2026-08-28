@@ -11,6 +11,7 @@ test("package metadata and comparison document the one-task subagent_wait model"
   assert.match(packageJson.description, /subagent_wait/);
   assert.match(comparison, /one task per call/);
   assert.match(comparison, /subagent_wait/);
+  assert.match(comparison, /subagent_stop/);
   assert.doesNotMatch(comparison, /single \/ parallel \/ chain/);
 });
 
@@ -19,4 +20,10 @@ test("README documents live allowlist enforcement and session-scoped background 
   assert.match(readme, /allowlist changes require a Pi session restart/);
   assert.match(readme, /collectable only during the current Pi session/);
   assert.match(readme, /Session shutdown aborts running children and forgets the background-run registry/);
+  assert.match(readme, /subagent_stop/);
+  assert.match(readme, /\/subagent-stop <session-id>/);
+  assert.match(readme, /F8.*focus/);
+  assert.match(readme, /arrow keys.*select/);
+  assert.match(readme, /\/subagent-panel/);
+  assert.match(readme, /JSON launcher/);
 });

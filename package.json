@@ -1,7 +1,7 @@
 {
   "name": "@nilskluewer/pi-subagent",
-  "version": "0.7.0",
-  "description": "Subagent tool for Pi: one task per call, inline or named agent personas, resumable sessions, background runs with subagent_wait, live widget, and a parent-side approval coordinator for the permission gate extension.",
+  "version": "0.8.0",
+  "description": "Subagent tool for Pi: one task per call, inline or named agent personas, resumable sessions, background runs with subagent_wait, a live subagent panel, and a parent-side approval coordinator for the permission gate extension.",
   "type": "module",
   "keywords": [
     "pi-package",

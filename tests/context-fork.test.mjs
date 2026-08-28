@@ -145,12 +145,13 @@ test("resolveSpec ignores forkContext placeholders on a resume call", () => {
     const sessionsDir = path.join(dir, "subagent-sessions");
     fs.mkdirSync(sessionsDir, { recursive: true });
     fs.writeFileSync(path.join(sessionsDir, "session-1.jsonl"), "");
-    fs.writeFileSync(path.join(sessionsDir, "session-1.meta.json"), JSON.stringify({ name: "prior", systemPrompt: "prior" }));
+    fs.writeFileSync(path.join(sessionsDir, "session-1.meta.json"), JSON.stringify({ name: "prior", systemPrompt: "prior", cwd: "/tmp/original-cwd" }));
 
     const result = resolveSpec({ resume: "session-1", forkContext: "all", task: "continue" }, [], 0);
 
     assert.ok("spec" in result);
     assert.equal(result.spec.isResume, true);
+    assert.equal(result.spec.cwd, "/tmp/original-cwd");
     assert.deepEqual(result.spec.forkContext, { mode: "none" });
   } finally {
     if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
