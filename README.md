@@ -1,314 +1,146 @@
 # @nilskluewer/pi-subagent
 
-<p align="center">
-  <img src="https://raw.githubusercontent.com/nilskluewer/pi-subagent/main/docs/assets/agent-tree.png" alt="A delegation run: main agent, coordinator socket, three subagents, capped result envelopes, and persisted session files" width="560" />
-</p>
+One `subagent` tool for Pi. It runs a task in an isolated `pi` child process and returns the answer **and the exact cost of the run**.
 
-One subagent extension for Pi that covers exactly what a multi-agent workflow needs:
+Everything else is left to Pi:
 
-- **`subagent` tool** - delegate one task to an isolated `pi` child process per call.
-  Emit several `subagent` calls in the same assistant turn for independent parallel work.
-  Call again with the previous result when work depends on an earlier task.
-- **`subagent_wait` tool** - collect results from background calls started with `async: true`.
-- **`subagent_stop` tool** - stop a running background subagent by session id while keeping its session resumable.
-- **`/subagent-stop <session-id>` command** - stop a background subagent from the Pi UI.
-- **Inline-first personas** - pass `systemPrompt` (+ optional `name`, `model`, and `tools`)
-  directly in the tool call. Use `model` as `provider/model-id[:thinking-level]`.
-  Skills define personas in their own text; no agent files are needed.
-- **Tool inheritance** - a subagent starts with the tools the main agent has, including
-  extension tools that are activated per session (MCP bridges). Pass `tools` to narrow it.
-- **Named agents (optional)** - markdown definitions in `~/.pi/agent/agents/*.md`
-  (or project-local `.pi/agents/*.md` with `agentScope: "both"`).
-- **Resumable sessions** - every run is a persistent session; pass the returned
-  session id as `resume` to continue that agent with full context
-  (e.g. reviewer proposes a fix → main agent implements → `resume` the reviewer to verify).
-  If a run is aborted, the parent receives the session id, stop reason, and last 10 completed
-  assistant messages/tool calls so it can inspect the working tree and resume intelligently.
-- **Live subagent panel** - running rows above the editor: status, model, current tool,
-  elapsed time, tokens, turns, task, cost, and nested-child counts. The configured model is visible
-  immediately; `default` is shown until an inherited model resolves. Rows disappear as soon as
-  the subagent finishes, so completed runs do not accumulate in the statusbar.
-  Press `F8` to focus the panel, then use the arrow keys to select a row. On MacBooks,
-  use `Fn+F8` when the function row is configured for media controls. `/subagent-panel` is a command
-  fallback. Press `x` to stop the selected background run and `Escape` to return to the editor.
-  Press Ctrl+O on the running tool call to inspect streaming output.
-  Completed sessions remain resumable through the `resume` parameter. A child that is already
-  running cannot receive new input through the current JSON launcher.
-- **Nested delegation with a root budget** - by default, depth-1 subagents can spawn one
-  more level of subagents (`maxDepth: 2`). A root-scoped coordinator enforces a default
-  tree-wide limit of 4 live child processes. Set `maxDepth: 1` to restore the old hard
-  grandchild ban.
-- **Parent-side approval coordinator** - dangerous-command policy itself lives in
-  [`@nilskluewer/pi-auto-permission-gate`](https://github.com/nilskluewer/pi-auto-permission-gate),
-  which loads in the main agent and in every subagent child.
-  When a child needs a manual confirmation, the gate proxies it over a Unix socket and the
-  prompt appears in the parent TUI labeled with the agent's name; concurrent prompts are
-  serialized. Normal `write`/`edit` calls follow the subagent's configured tool allowlist
-  without an extra prompt. No UI and no approval channel blocks the call.
+| Need | Use |
+|---|---|
+| Parallel runs, chains, merge or filter results | the built-in [`codemode`](https://github.com/earendil-works/pi) tool (`Promise.all` over `tools.subagent`) |
+| Cost per run | the result header and `cost` field |
+| Cost per session | Pi's own totals: the tool result carries `usage`, so the footer and `/session` include it |
+| Stop a run | `Esc` (the abort kills the child's process group) |
+| Durable, crash-proof agents | [Pi Durable](https://earendil.com/posts/pi-durable/), a separate framework |
 
-Replaces `@nilskluewer/pi-minimal-subagent` (the `delegate` tool).
-Install the permission gate extension alongside this one to keep dangerous bash commands
-gated in the main agent and in subagents.
+The extension is about 570 lines (was about 4,300). Version 0.9.0 removed the live panel, background runs, nested delegation, context forking, the approval coordinator, and the `/subagent-*` commands. See [Migrating](#migrating-from-08).
 
 ## Install
 
 ```bash
-pi install npm:@nilskluewer/pi-subagent
+pi install npm:@nilskluewer/pi-subagent     # or: pi install git:github.com/nilskluewer/pi-subagent
 ```
 
-From git:
+Turn on codemode for orchestration (`defaultTools: ["+codemode"]` in `~/.pi/agent/settings.json`, see the Pi docs).
 
-```bash
-pi install git:github.com/nilskluewer/pi-subagent
-```
-
-From a local checkout:
-
-```bash
-pi install /path/to/pi-subagent
-```
-
-## How a delegation runs
-
-Six stations, from the first tool call to a resumable session:
-
-<p align="center">
-  <img src="https://raw.githubusercontent.com/nilskluewer/pi-subagent/main/docs/assets/walkthrough.png" alt="Six-step walkthrough: Delegate, Fork, Spawn, Gate, Report, Resume" width="820" />
-</p>
-
-There is an animated version of this walkthrough: open
-[`docs/one-pager.html`](https://github.com/nilskluewer/pi-subagent/blob/main/docs/one-pager.html)
-locally (`open docs/one-pager.html`) for the step-through animation, feature grid,
-and config reference on a single page.
-
-## Tool usage
-
-One call with an inline persona:
+## The tool
 
 ```jsonc
-{ "systemPrompt": "You are a security reviewer...", "name": "security", "model": "anthropic-vertex/claude-sonnet-5:high", "tools": "read,grep,find,ls", "task": "Review src/auth.ts" }
+{ "task": "Review src/auth.ts", "systemPrompt": "You are a security reviewer.", "name": "security",
+  "model": "anthropic-vertex/claude-sonnet-5:high", "tools": "read,grep,find,ls" }
 ```
 
-`model` accepts an exact `provider/model-id` and an optional `:thinking-level` suffix.
-Thinking levels are `off | minimal | low | medium | high | xhigh | max`.
-Omit the model to use the configured or child-process default.
+| Parameter | Meaning |
+|---|---|
+| `task` | Required. The child starts with an empty context, so include everything it needs. |
+| `agent` / `systemPrompt` / `resume` | At most one. A named agent, an inline persona, or the session id of an earlier run. |
+| `name` | Display label. |
+| `model` | `provider/model-id[:thinking]`. Levels: `off minimal low medium high xhigh max`. |
+| `tools` | Comma-separated allowlist. Default: the tools the caller has (see [Tool inheritance](#tool-inheritance)). |
+| `cwd` | Working directory of the child. |
 
-For independent work, emit several separate `subagent` calls in the same assistant turn.
-Give each call a disjoint write scope so the calls can run concurrently without conflicts.
-
-Continue an agent later (session id is in every result):
-
-```jsonc
-{ "resume": "0197c0de-...", "task": "I implemented your fix in src/auth.ts - verify it is correct." }
-```
-
-Fork parent context into a new agent session:
-
-```jsonc
-{ "agent": "example-researcher", "forkContext": "all", "task": "Continue from the main conversation and inspect the retry logic." }
-```
-
-Named agent:
-
-```jsonc
-{ "agent": "example-researcher", "task": "Where is the retry logic implemented?" }
-```
-
-For dependent work, call `subagent` again with the previous result in the new task.
-Pass the returned session id as `resume` when the same agent should continue with its full context.
-
-```jsonc
-{ "systemPrompt": "You write concise ADRs.", "name": "adr-writer", "task": "Write an ADR based on the previous review result:\n\n<previous result>" }
-```
-
-## Context forking
-
-By default, every subagent starts with an isolated, empty conversation and only the task text you give it.
-Set `forkContext` to copy sanitized context from the calling agent into the child session before it starts.
-Use `"all"` to fork the full active context, or a positive integer string such as `"3"` to fork the last three user-message turns.
-Use `"none"` or omit the field to keep the old isolated behavior.
-`forkContext` and `resume` are mutually exclusive because a resumed session already has its own append-only history.
-Forking keeps user messages verbatim, keeps assistant text, drops tool noise and thinking, and converts compaction or branch summaries into a synthetic user summary.
-Large forks over roughly 8k approximate tokens return a warning and continue.
-
-Examples:
-
-```jsonc
-{ "systemPrompt": "You are a focused reviewer.", "name": "reviewer", "forkContext": "all", "task": "Review the current plan using the conversation context." }
-{ "agent": "example-researcher", "forkContext": "2", "task": "Use the last two turns of context and find the relevant files." }
-```
-
-## Result cap
-
-Non-aborted subagent results returned to the calling model are wrapped in a compact envelope and capped by approximate token count.
-Aborted results keep their specialized recovery format, including recent activity and resume guidance, and are not re-capped.
-The cap affects only the model-facing tool result text for non-aborted results.
-It never truncates the child process, the child session file, or the rich details used by the TUI and Ctrl+O.
-The default cap is 1000 approximate tokens.
-Set `resultCapTokens` to `0` to disable capping.
-Precedence is the call's `resultCapTokens`, then `~/.pi/agent/subagent.json`, then the built-in default of `1000`.
-Set the cap separately on each call when several subagents run concurrently.
-When a run finishes, its uncapped result payload is written atomically to `<sessionsDir>/<sessionId>.output.md` with restrictive permissions.
-If the result is truncated, the envelope points to that artifact first and recommends the normal `read` tool with offsets for inspecting parts of it.
-The envelope header includes non-zero cost and turn counts, while zero or unknown cost is omitted.
-
-Envelope example:
+The result starts with a header:
 
 ```text
-[agent: reviewer | model: github-copilot/gpt-5.6-luna | status: completed | cost: $0.0042 | turns: 3 | session: 0197c0de]
+[agent: reviewer | model: github-copilot/gpt-6-luna | status: completed | cost: $0.0042 | turns: 3 | session: 0197c0de-…]
 
-Result text...
-
-[truncated: showing ~1000 of ~4200 approx. tokens. Full output: read /Users/me/.pi/agent/subagent-sessions/0197c0de.output.md with the normal read tool; use offsets to inspect parts of it. Then resume session "0197c0de" to continue this agent with full context.]
+Result text…
 ```
 
-## Subagent configuration
+- A failed or aborted run still returns its partial text, its cost, and (when aborted) a `resume` hint.
+- The text shown to the model is capped at about 16 KB. The full text is in `<sessionsDir>/<id>.output.md`, and a note names the file.
+- Sessions live in `~/.pi/agent/subagent-sessions/<id>.jsonl` with a `<id>.meta.json` that re-applies the persona on `resume`.
 
-`~/.pi/agent/subagent.json` configures delegation guidance, result capping, nested depth, the root-scoped live-child budget, subagent model defaults, and the optional model allowlist.
-The file is optional.
-Missing or malformed JSON falls back to safe built-in values, and a malformed file is never overwritten by `/subagent-defaults`.
-Policy, cap, depth, and budget changes take effect at the next session start, such as `/new`, `/resume`, `/fork`, `/reload`, or restarting Pi.
-The model default changed with `/subagent-defaults` applies to future subagent calls immediately.
-Thinking levels are configured in the combined `model` value.
-The `allowedModels` policy is read from the live file for every subagent call, so the runtime still enforces the live file immediately after an edit.
-The model schema enum snapshots the allowlist when the tools register, so allowlist changes require a Pi session restart before the schema reflects them.
-The current scoped model candidates are injected into the system prompt each turn.
-When no scope is active, the candidates fall back to Pi's available model registry.
+## Cost
 
-```jsonc
-{
-  "delegationPolicy": "proactive",
-  "resultCapTokens": 1000,
-  "defaultModel": "anthropic-vertex/claude-sonnet-5:medium",
-  "allowedModels": [
-    "github-copilot/gpt-5.6-luna:high",
-    "anthropic-vertex/claude-sonnet-5:medium"
-  ],
-  "maxDepth": 2,
-  "maxLiveChildren": 4,
-  "budgetAcquireTimeoutMs": 120000
-}
+The tool result has a `usage` field. Pi adds it to the session totals, so the footer and `/session` include the subagent cost. This is also true when the call runs inside a `codemode` script: the script result carries the sum of its nested calls.
+
+Each result also has its own `cost`, `turns`, and `tokens`, so you can see which subagent was expensive.
+
+Custom footers must count `toolResult` usage as well as assistant usage. [pi-cost-transparency-statusline](https://github.com/nilskluewer/pi-cost-transparency-statusline) does.
+
+## Parallel work with codemode
+
+The tool declares an `outputSchema`, so a script gets an object: `{ text, status, sessionId, agent, model, cost, turns, tokens, errorMessage?, outputFile? }`. Only what the script returns reaches the parent context.
+
+Fan out and merge:
+
+```js
+const files = ["src/auth.ts", "src/session.ts", "src/token.ts"];
+const runs = await Promise.allSettled(
+  files.map((file) => tools.subagent({ agent: "reviewer", name: file, task: `Review ${file}. Reply with at most 5 bullet points.` })),
+);
+const ok = runs.filter((r) => r.status === "fulfilled").map((r) => r.value);
+return {
+  cost: ok.reduce((sum, r) => sum + r.cost, 0),
+  reviews: ok.map((r) => `## ${r.agent} (${r.status})\n${r.text}`).join("\n\n"),
+  failed: runs.filter((r) => r.status === "rejected").map((r) => String(r.reason)),
+};
 ```
 
-`allowedModels` is optional.
-When present, it overrides `defaultModel` and restricts every subagent to the exact combined values in the list.
-Each entry must use `provider/model-id:thinking-level`.
-The first entry is the fallback when a call does not specify a model.
-An empty or malformed `allowedModels` value fails closed and prevents subagent resolution.
+Chain, with a resume:
 
-### `/subagent-defaults`
+```js
+const review = await tools.subagent({ agent: "reviewer", task: "Review the diff of HEAD~1." });
+// … apply fixes with other tools here …
+const verify = await tools.subagent({ resume: review.sessionId, task: "I applied your fixes. Verify them." });
+return { review: review.text, verify: verify.text, cost: review.cost + verify.cost };
+```
 
-Use `/subagent-defaults` with no arguments in the UI for an interactive picker.
-The model picker and model argument completions use scoped models when a scope is active and all available models otherwise.
-Configure a session model scope with Pi's `--models` option or the `enabledModels` setting to narrow the candidates.
-Use `/subagent-defaults show` to display the current values without changing the main agent model.
-Use `/subagent-defaults model <provider/model-id[:thinking]>` to set an exact model specification from Pi's current model registry.
-Use `/subagent-defaults clear model` or `/subagent-defaults model clear` to clear the model default.
-Use `/subagent-defaults clear` or `/subagent-defaults reset` to clear the model default.
-Thinking levels are part of each combined model specification.
+Keep run ids across scripts with `store("runs", [...])` and `load("runs")`. A script has no checkpoints. If Pi exits during a script, the children stop with it. Resume them by session id.
 
-Model specifications are validated with Pi's exact registry lookup before they are persisted.
-Known models can be configured even when their provider is not currently authenticated.
-Unknown models are rejected and are never written to `subagent.json`.
-The command preserves unrelated JSON keys and uses a safe atomic update.
-The extension splits the combined value into `--model` and `--thinking` when launching a child process.
-An explicit tool-call model takes precedence over named-agent configuration, the configured default, resumed-session metadata, and the Pi child-process default.
-
-`delegationPolicy` accepts:
-
-- `"proactive"` (default): use subagents when they can make useful independent progress.
-- `"explicit-request-only"`: only use `subagent` when the user or an active skill explicitly requests delegation.
-- Any other string: use it verbatim as the policy line.
-
-`resultCapTokens` is a non-negative number.
-`0` disables the configured default cap unless a per-call value overrides it.
-
-`maxDepth` is a positive integer.
-The default is `2`, so depth-1 subagents get the `subagent` tool and can spawn depth-2 leaves.
-Set `maxDepth` to `1` to opt out of nested delegation and restore the old behavior where subagents cannot spawn grandchildren.
-
-`maxLiveChildren` is a positive integer and defaults to `4`.
-It is enforced tree-wide by the root coordinator, not separately in each branch.
-Several root-level calls emitted in one assistant turn run concurrently, while each delegation tree remains bounded by its configured live-child budget.
-
-`budgetAcquireTimeoutMs` is a positive integer and defaults to `120000`.
-If all live-child slots are busy for longer than this timeout, the attempted spawn returns a clear budget-exhausted result instead of waiting forever.
-
-## Delegating one task per call
-
-The `subagent` tool accepts one delegated task per call.
-Emit multiple `subagent` calls in the same assistant turn for independent parallel work.
-For dependent work, call again with the previous result or pass a returned session id as `resume`.
-
-Set `async` to `true` to start a subagent without blocking the parent turn.
-The async response names the agent and session id, and instructs the parent to call `subagent_wait` with that id.
-Call `subagent_stop` with that id to abort a running background child without deleting its resumable session.
-Use `/subagent-stop <session-id>` to stop the same run from the Pi UI. In the interactive TUI,
-`F8` focuses the subagent panel (`Fn+F8` on MacBooks when needed).
-The `/subagent-panel` command is a terminal-independent fallback. Arrow keys select a running row
-and `x` requests a stop. Finished rows disappear immediately.
-Call `subagent_wait` with `all: true` to collect every tracked run, omit `id` to collect the first run to finish, or pass `timeoutMs` to bound the wait.
-Background runs are tracked and collectable only during the current Pi session.
-A timeout or an aborted wait reports still-running session ids without cancelling their child processes.
-Completed and failed results remain available for repeated collection by session id during the current session.
-Session shutdown aborts running children and forgets the background-run registry.
-
-## Default-on nesting change in 0.5.0
-
-The default `maxDepth` is now `2`.
-Depth-1 subagents can use the `subagent` tool to spawn depth-2 leaves, and a coordinator socket is active by default to enforce `maxLiveChildren` across the tree.
-Set `maxDepth` to `1` in `~/.pi/agent/subagent.json` to restore the previous no-grandchildren behavior.
-
-## Breaking change in 0.3.0
-
-The `quick_task` tool has been removed.
-`~/.pi/agent/quick-task.json` is no longer read and is now inert.
-If you used `quick_task`, call `subagent` directly with an inline `systemPrompt`, or move that prompt into a named agent under `~/.pi/agent/agents/`.
-All `subagent` calls are persistent, resumable sessions.
-
-## Agent definition format (named agents)
+## Named agents
 
 `~/.pi/agent/agents/<name>.md`:
 
 ```markdown
 ---
-name: example-researcher
-description: Read-only research agent
-tools: read, grep, find, ls
+name: reviewer
+description: Read-only reviewer
 model: anthropic-vertex/claude-sonnet-5:medium
+tools: read, grep, find, ls
 ---
 
 System prompt goes here.
 ```
 
+Model precedence: the call, then the agent file (or the resumed session), then `defaultModel` in `subagent.json`.
+
+## Configuration
+
+`~/.pi/agent/subagent.json` is optional and is read on every call:
+
+```jsonc
+{
+  "defaultModel": "anthropic-vertex/claude-sonnet-5:medium",
+  "allowedModels": ["github-copilot/gpt-6-luna:max", "anthropic-vertex/claude-sonnet-5:medium"]
+}
+```
+
+`allowedModels` limits every subagent to these exact `provider/model:thinking` values. The first entry is the default. An empty or malformed list blocks all calls. Other keys from older versions are ignored.
+
 ## How it works
 
-- Subagents are spawned as `pi --mode json -p --session <file>` child processes; the JSONL
-  event stream drives live rendering, the widget, and usage accounting.
-- Sessions and metadata live in `~/.pi/agent/subagent-sessions/` (`<id>.jsonl` + `<id>.meta.json`);
-  metadata re-applies the persona/model/tools on `resume`.
-- The extension loads in child processes too (global discovery). It registers the `subagent`
-  tool whenever the current `PI_SUBAGENT_DEPTH` is below `maxDepth`. With the default
-  `maxDepth: 2`, depth-1 children can spawn depth-2 leaves; depth-2 leaves cannot spawn deeper.
-- The root process owns a coordinator socket when UI approvals are needed or when `maxDepth > 1`
-  (the default). Children receive `PI_SUBAGENT_COORDINATOR_SOCKET` for approval proxying,
-  live-child budget leases, and compact `+N nested` widget status updates. The permission gate
-  extension is the client for the approval part of that protocol (see
-  `extensions/subagent/approval-protocol.ts`). This environment variable is internal;
-  `PI_SUBAGENT_INHERITED_TOOLS` remains the public inheritance contract.
-- Aborting a subagent attempts to terminate the whole spawned process group on macOS and Linux.
-  Windows uses a best-effort `taskkill /pid <pid> /t /f` fallback that is implemented but untested.
-- Every child is spawned with `PI_SUBAGENT_INHERITED_TOOLS`: a comma-separated list of the
-  parent's active tools, or of the explicit `tools` allowlist when one was given. Built-in and
-  extension tools load in the child anyway; the variable exists for tools that are only
-  registered after an in-session activation, such as MCP bridges, which cannot run their
-  interactive picker in a headless child. Extensions that opt into the contract read the
-  variable at `session_start` and re-activate the same selection - see
-  [pi-atlassian-mcp](https://github.com/nilskluewer/pi-atlassian-mcp).
+- The child is `pi --mode json -p --session <file>`. The extension folds its JSONL events into one result, summing `usage` of each assistant message. The task goes to the child in an `@file` argument, not in argv.
+- The child runs in its own process group on macOS and Linux. An abort sends `SIGTERM`, then `SIGKILL` after 5 s. On Windows only the child itself is signalled.
+- Children get `PI_SUBAGENT=1`, `PI_SUBAGENT_NAME`, `PI_SUBAGENT_SESSION_ID`, and exit if the parent dies. Children do not get the `subagent` tool, so delegation is one level deep. The parent orchestrates.
+- `PI_SUBAGENT_INHERITED_TOOLS` lists the parent's active tools, or the `tools` allowlist. It re-activates tools that exist only after an in-session activation, such as MCP bridges (see [pi-atlassian-mcp](https://github.com/nilskluewer/pi-atlassian-mcp)).
 
-## Repository
+## Tool inheritance
 
-https://github.com/nilskluewer/pi-subagent
+A child loads the same extensions as the parent and gets the parent's active tools through `PI_SUBAGENT_INHERITED_TOOLS`. Pass `tools` to narrow this.
+
+## Migrating from 0.8
+
+| Removed | Instead |
+|---|---|
+| `async`, `subagent_wait`, `subagent_stop`, `/subagent-stop` | `Promise.all` in codemode, or several calls in one turn. Stop with `Esc`. |
+| Live panel, `F8`, `/subagent-panel` | The footer shows total cost. Each result shows its own. |
+| `forkContext` | Put the needed context in `task`. |
+| Nested subagents, `maxDepth`, `maxLiveChildren` | Orchestrate from the parent with codemode. |
+| `resultCapTokens`, result envelope | Fixed 16 KB cap, full text in `structuredContent` and on disk. |
+| `agentScope`, project-local agents | Only `~/.pi/agent/agents`. |
+| Approval coordinator socket | None. Children use whatever permission extension they load. |
+| `/subagent-defaults`, `delegationPolicy` | Edit `subagent.json`. The tool carries its own usage guidelines. |
 
 ## License
 
