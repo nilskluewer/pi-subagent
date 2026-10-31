@@ -18,6 +18,7 @@ import { type ExtensionAPI, DEFAULT_MAX_BYTES, formatSize, truncateHead } from "
 import { type ChildResult, type Progress, runChild } from "./child.ts";
 import { setActiveToolsProvider } from "./inherited-tools.ts";
 import { resolveSpec, sessionsDir, writeMeta } from "./spec.ts";
+import { createWorkerMonitor } from "./workers.ts";
 
 /** Model-facing text per call. The full text stays in structuredContent and on disk. */
 const MAX_LINES = 300;
@@ -41,6 +42,9 @@ const Output = Type.Object({
 	sessionId: Type.String({ description: "Pass as `resume` to continue this agent." }),
 	agent: Type.String(),
 	model: Type.Optional(Type.String()),
+	requestedModel: Type.Optional(Type.String()),
+	thinking: Type.Optional(Type.String({ description: "Thinking level reported by the child, if available." })),
+	requestedThinking: Type.Optional(Type.String({ description: "Configured thinking level passed at dispatch." })),
 	cost: Type.Number({ description: "USD for this run." }),
 	turns: Type.Number(),
 	tokens: Type.Object({ input: Type.Number(), output: Type.Number(), cacheRead: Type.Number(), cacheWrite: Type.Number() }),
@@ -55,11 +59,12 @@ export const describeUsage = (usage: Usage, turns: number) =>
 	`${money(usage.cost.total)} · ${turns} turn${turns === 1 ? "" : "s"} · ↑${kilo(usage.input)} ↓${kilo(usage.output)}`;
 
 export function buildContent(
-	meta: { agent: string; sessionId: string; run: ChildResult },
+	meta: { agent: string; sessionId: string; run: ChildResult; requestedThinking?: string },
 	outputFile?: string,
 ): { header: string; body: string; truncated: boolean } {
 	const { run } = meta;
-	const header = `[agent: ${meta.agent} | model: ${run.model ?? "default"} | status: ${run.status} | cost: ${money(run.usage.cost.total)} | turns: ${run.turns} | session: ${meta.sessionId}]`;
+	const thinking = run.thinking ?? meta.requestedThinking;
+	const header = `[agent: ${meta.agent} | model: ${run.model ?? "default"}${thinking ? ` | thinking: ${thinking}${run.thinking ? "" : " (set)"}` : ""} | status: ${run.status} | cost: ${money(run.usage.cost.total)} | turns: ${run.turns} | session: ${meta.sessionId}]`;
 	let body = run.text || "(no output)";
 	if (run.status !== "completed") {
 		const resume = `Resume with {"resume":"${meta.sessionId}","task":"…"}.`;
@@ -86,6 +91,7 @@ export default function (pi: ExtensionAPI) {
 		return;
 	}
 	setActiveToolsProvider(() => pi.getActiveTools());
+	const workers = createWorkerMonitor(pi);
 
 	pi.registerTool({
 		name: "subagent",
@@ -102,30 +108,43 @@ export default function (pi: ExtensionAPI) {
 		parameters: Params,
 		outputSchema: Output,
 
-		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			const spec = resolveSpec(params);
 			if (!spec.isResume) writeMeta(spec);
 			const cwd = params.cwd?.trim() || ctx.cwd;
 
-			const send = (p: Progress) =>
+			const send = (p: Progress) => {
+				workers.update(toolCallId, p);
 				onUpdate?.({
-					content: [{ type: "text", text: `running… ${describeUsage(p.usage, p.turns)}${p.tool ? ` · ${p.tool}` : ""}` }],
+					content: [{ type: "text", text: `running… ${p.model ?? spec.model ?? "default"} · think ${p.thinking ?? spec.thinking ?? "default"} · ${describeUsage(p.usage, p.turns)}${p.tool ? ` · ${p.tool}` : ""}` }],
 					details: { sessionId: spec.sessionId },
 				});
-			const run = await runChild({ spec, task: params.task, cwd, signal, onProgress: send });
+			};
+			const onStarted = workers.dispatch(ctx, toolCallId, spec);
+			let run: ChildResult;
+			try {
+				run = await runChild({ spec, task: params.task, cwd, signal, onProgress: send, onStarted });
+			} catch (error) {
+				workers.fail(toolCallId);
+				throw error;
+			}
+			workers.finish(toolCallId, run);
 
 			let outputFile: string | undefined;
 			if (Buffer.byteLength(run.text) > MAX_BYTES || run.text.split("\n").length > MAX_LINES) {
 				outputFile = path.join(sessionsDir(), `${spec.sessionId}.output.md`);
 				fs.writeFileSync(outputFile, run.text, { mode: 0o600 });
 			}
-			const { header, body } = buildContent({ agent: spec.name, sessionId: spec.sessionId, run }, outputFile);
+			const { header, body } = buildContent({ agent: spec.name, sessionId: spec.sessionId, run, requestedThinking: spec.thinking }, outputFile);
 			const structured = {
 				text: run.text,
 				status: run.status,
 				sessionId: spec.sessionId,
 				agent: spec.name,
 				model: run.model,
+				requestedModel: spec.model,
+				thinking: run.thinking,
+				requestedThinking: spec.thinking,
 				cost: run.usage.cost.total,
 				turns: run.turns,
 				tokens: { input: run.usage.input, output: run.usage.output, cacheRead: run.usage.cacheRead, cacheWrite: run.usage.cacheWrite },

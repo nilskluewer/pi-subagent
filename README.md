@@ -7,12 +7,13 @@ Everything else is left to Pi:
 | Need | Use |
 |---|---|
 | Parallel runs, chains, merge or filter results | the built-in [`codemode`](https://github.com/earendil-works/pi) tool (`Promise.all` over `tools.subagent`) |
+| Live model, tokens, time, and cost | the automatic worker widget, also inside `codemode` |
 | Cost per run | the result header and `cost` field |
 | Cost per session | Pi's own totals: the tool result carries `usage`, so the footer and `/session` include it |
 | Stop a run | `Esc` (the abort kills the child's process group) |
 | Durable, crash-proof agents | [Pi Durable](https://earendil.com/posts/pi-durable/), a separate framework |
 
-The extension is about 570 lines (was about 4,300). Version 0.9.0 removed the live panel, background runs, nested delegation, context forking, the approval coordinator, and the `/subagent-*` commands. See [Migrating](#migrating-from-08).
+Version 0.9.0 removed the legacy live panel, background runs, nested delegation, context forking, the approval coordinator, and the `/subagent-*` commands. A compact worker widget now provides live metadata without a separate panel or background orchestration. See [Migrating](#migrating-from-08).
 
 ## Install
 
@@ -50,6 +51,36 @@ Result text…
 - The text shown to the model is capped at about 16 KB. The full text is in `<sessionsDir>/<id>.output.md`, and a note names the file.
 - Sessions live in `~/.pi/agent/subagent-sessions/<id>.jsonl` with a `<id>.meta.json` that re-applies the persona on `resume`.
 
+## Live workers
+
+In Pi's interactive terminal, a widget above the editor appears as soon as a child process starts. It works for direct calls and calls inside `codemode`, even when the script returns only `run.text`.
+
+```text
+Subagents · 2 active · running Σ $0.0042 reported
+├─ ◐ reviewer  github-copilot/gemini-4-argon · think medium (set)
+│   00:24 · ↑1.2k ↓830 tokens · $0.0031 reported
+│   Checking the error handling…
+└─ ◐ tests  github-copilot/claude-sonnet-5.5 · think medium (set)
+    00:11 · ↑1.0k ↓420 tokens · $0.0011 reported
+    bash · npm test
+```
+
+- Model and thinking settings appear at dispatch. `(requested)` marks an unconfirmed model; `(set)` marks a configured thinking level. Reported model and thinking values replace these when the child emits them.
+- Each worker shows its **subagent-session cost**, including previous runs on resume. `running Σ` sums only sessions with active workers, not completed sessions and not the main model.
+- Time and the activity indicator update while a worker waits. Tokens and costs update when the provider reports usage; some providers report it only at the end of a response. They are not estimates or a percentage-complete indicator.
+- The preview shows the latest normal assistant text, or current tool activity. It does not show internal thinking text. Terminal control sequences are removed before display.
+- Completed, failed, and aborted workers shrink to compact rows showing the latest three finished sessions. On narrower terminals, a second line keeps final costs visible.
+- After the last worker finishes, the overview stays visible for the next user message and disappears on the **second** user message. Messages submitted while workers are active, extension-generated prompts, and commands such as `/reload` do not advance the count. Image-only user messages do count. New workers automatically reopen the overview and start a new count after completion.
+- Finished metadata and the message count are saved outside the model context and restored on reload, so hidden results stay hidden without losing their cost data. A new main session clears the display; tree navigation restores the selected branch. The existing footer is not replaced.
+
+JSON, print, and RPC modes do not mount the terminal widget. Structured results still include `model`, `requestedModel`, `thinking`, `requestedThinking`, `cost`, `turns`, and `tokens`. Here `cost` remains **per run**, so adding results does not count old resumed-session costs twice.
+
+## Context boundaries
+
+A new subagent does not receive the main session's conversation. It receives the explicit `task` and loads its own system and project instructions. It can access files through its tools, so conversation isolation is **not** a filesystem or permission boundary. A resumed subagent receives its own saved history, not the main session's history.
+
+The main session receives the final response and metadata, not every child tool call or assistant message. With `codemode`, only values printed or returned by the script enter the main model's context. The worker widget is independent of that output filter.
+
 ## Cost
 
 The tool result has a `usage` field. Pi adds it to the session totals, so the footer and `/session` include the subagent cost. This is also true when the call runs inside a `codemode` script: the script result carries the sum of its nested calls.
@@ -60,7 +91,7 @@ Custom footers must count `toolResult` usage as well as assistant usage. [pi-cos
 
 ## Parallel work with codemode
 
-The tool declares an `outputSchema`, so a script gets an object: `{ text, status, sessionId, agent, model, cost, turns, tokens, errorMessage?, outputFile? }`. Only what the script returns reaches the parent context.
+The tool declares an `outputSchema`, so a script gets an object: `{ text, status, sessionId, agent, model?, requestedModel?, thinking?, requestedThinking?, cost, turns, tokens, errorMessage?, outputFile? }`. Only what the script returns reaches the parent context.
 
 Fan out and merge:
 
@@ -134,13 +165,23 @@ A child loads the same extensions as the parent and gets the parent's active too
 | Removed | Instead |
 |---|---|
 | `async`, `subagent_wait`, `subagent_stop`, `/subagent-stop` | `Promise.all` in codemode, or several calls in one turn. Stop with `Esc`. |
-| Live panel, `F8`, `/subagent-panel` | The footer shows total cost. Each result shows its own. |
+| Live panel, `F8`, `/subagent-panel` | Automatic worker widget for live metadata; footer for total session cost. |
 | `forkContext` | Put the needed context in `task`. |
 | Nested subagents, `maxDepth`, `maxLiveChildren` | Orchestrate from the parent with codemode. |
 | `resultCapTokens`, result envelope | Fixed 16 KB cap, full text in `structuredContent` and on disk. |
 | `agentScope`, project-local agents | Only `~/.pi/agent/agents`. |
 | Approval coordinator socket | None. Children use whatever permission extension they load. |
 | `/subagent-defaults`, `delegationPolicy` | Edit `subagent.json`. The tool carries its own usage guidelines. |
+
+## Development checks
+
+```bash
+npm test             # accumulator, worker display, lifecycle, and configuration tests
+npm run smoke        # load the packed package in a real Pi process
+npm run test:tui     # real TUI -> codemode -> two real child processes; requires pi + tmux
+```
+
+The TUI check uses an isolated agent directory and an offline fixture provider. It checks live metadata, completion, reload, resume costs, session reset, Escape cancellation, dismissal after two user messages, and automatic reopening without model costs or user credentials.
 
 ## License
 

@@ -7,6 +7,7 @@ import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import type { Usage } from "@earendil-works/pi-ai";
 import { inheritedToolsEnv } from "./inherited-tools.ts";
 import type { Spec } from "./spec.ts";
@@ -20,6 +21,7 @@ export interface ChildResult {
 	errorMessage?: string;
 	/** Model the child actually used. */
 	model?: string;
+	thinking?: string;
 	usage: Usage;
 	turns: number;
 	stderr: string;
@@ -29,6 +31,9 @@ export interface Progress {
 	usage: Usage;
 	turns: number;
 	tool?: string;
+	model?: string;
+	thinking?: string;
+	preview?: string;
 }
 
 export const emptyUsage = (): Usage => ({
@@ -55,10 +60,29 @@ function addUsage(into: Usage, add: Partial<Usage> | undefined): void {
 /** Fold JSONL events from `pi --mode json` into a result. Pure, so it is testable without a child. */
 export function createAccumulator() {
 	const result: ChildResult = { status: "completed", text: "", usage: emptyUsage(), turns: 0, stderr: "" };
-	let tool: string | undefined;
+	const tools = new Map<string, string>();
+	let pending = emptyUsage();
+	let preview = "";
+	const textBlocks = new Map<number, string>();
+	const liveUsage = () => {
+		const usage = emptyUsage();
+		addUsage(usage, result.usage);
+		addUsage(usage, pending);
+		return usage;
+	};
 	return {
 		result,
-		progress: (): Progress => ({ usage: result.usage, turns: result.turns, tool }),
+		progress: (): Progress => ({
+			usage: liveUsage(), turns: result.turns, tool: [...tools.values()].at(-1),
+			model: result.model, thinking: result.thinking, preview,
+		}),
+		/** Preserve a truncated stream when the process exits without message_end. */
+		finish() {
+			addUsage(result.usage, pending);
+			pending = emptyUsage();
+			const partial = [...textBlocks.values()].join("");
+			if (partial) result.text = partial;
+		},
 		/** Returns true when the event changed the progress. */
 		push(line: string): boolean {
 			let event: any;
@@ -68,18 +92,48 @@ export function createAccumulator() {
 				return false;
 			}
 			if (event.type === "tool_execution_start") {
-				tool = event.toolName ?? "tool";
+				const detail = event.args?.path ?? event.args?.command;
+				tools.set(event.toolCallId ?? "tool", `${event.toolName ?? "tool"}${typeof detail === "string" ? ` · ${detail.slice(0, 200)}` : ""}`);
 				return true;
 			}
 			if (event.type === "tool_execution_end") {
-				tool = undefined;
+				tools.delete(event.toolCallId ?? "tool");
+				return true;
+			}
+			if (event.type === "thinking_level_changed") {
+				result.thinking = event.level;
+				return true;
+			}
+			if (event.type === "message_start" && event.message?.role === "assistant") {
+				pending = emptyUsage();
+				textBlocks.clear();
+				preview = "";
+				if (event.message.model) result.model = `${event.message.provider ? `${event.message.provider}/` : ""}${event.message.model}`;
+				if (event.message.thinkingLevel) result.thinking = event.message.thinkingLevel;
+				return true;
+			}
+			if (event.type === "message_update") {
+				if (event.usage) {
+					pending = emptyUsage();
+					addUsage(pending, event.usage);
+				}
+				const delta = event.assistantMessageEvent;
+				if (delta?.type === "text_delta" || delta?.type === "text_end") {
+					const index = delta.contentIndex ?? 0;
+					const text = delta.type === "text_end" ? delta.content : (textBlocks.get(index) ?? "") + delta.delta;
+					textBlocks.set(index, text);
+					preview = text.slice(-300);
+				}
 				return true;
 			}
 			const message = event.type === "message_end" ? event.message : undefined;
 			if (message?.role !== "assistant") return false;
 			result.turns++;
 			addUsage(result.usage, message.usage);
+			pending = emptyUsage();
+			textBlocks.clear();
 			if (message.model) result.model = `${message.provider ? `${message.provider}/` : ""}${message.model}`;
+			if (message.thinkingLevel) result.thinking = message.thinkingLevel;
 			// The last message decides: pi retries a failed request with a new message.
 			if (message.stopReason === "error" || message.stopReason === "aborted") {
 				result.status = message.stopReason;
@@ -92,7 +146,10 @@ export function createAccumulator() {
 				.filter((part: any) => part.type === "text")
 				.map((part: any) => part.text)
 				.join("");
-			if (text) result.text = text;
+			if (text) {
+				result.text = text;
+				preview = text.slice(-300);
+			}
 			return true;
 		},
 	};
@@ -126,11 +183,12 @@ export interface RunOptions {
 	cwd: string;
 	signal?: AbortSignal;
 	onProgress?: (progress: Progress) => void;
+	onStarted?: () => void;
 	/** Override the launcher. Tests use this to run a fake child. */
 	invocation?: (args: string[]) => { command: string; args: string[] };
 }
 
-export async function runChild({ spec, task, cwd, signal, onProgress, invocation = piInvocation }: RunOptions): Promise<ChildResult> {
+export async function runChild({ spec, task, cwd, signal, onProgress, onStarted, invocation = piInvocation }: RunOptions): Promise<ChildResult> {
 	const acc = createAccumulator();
 	const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-"));
 	try {
@@ -159,6 +217,7 @@ export async function runChild({ spec, task, cwd, signal, onProgress, invocation
 					...inheritedToolsEnv(spec.tools),
 				},
 			});
+			proc.once("spawn", () => onStarted?.());
 			const kill = (sig: NodeJS.Signals) => {
 				try {
 					if (detached && proc.pid) process.kill(-proc.pid, sig);
@@ -177,11 +236,12 @@ export async function runChild({ spec, task, cwd, signal, onProgress, invocation
 			else signal?.addEventListener("abort", onAbort, { once: true });
 
 			let buffer = "";
+			const decoder = new StringDecoder("utf8");
 			const feed = (line: string) => {
 				if (line.trim() && acc.push(line)) onProgress?.(acc.progress());
 			};
 			proc.stdout.on("data", (data) => {
-				buffer += data.toString();
+				buffer += decoder.write(data);
 				const lines = buffer.split("\n");
 				buffer = lines.pop() ?? "";
 				lines.forEach(feed);
@@ -192,7 +252,7 @@ export async function runChild({ spec, task, cwd, signal, onProgress, invocation
 			const finish = (code: number | null, exitSignal: NodeJS.Signals | null) => {
 				clearTimeout(escalation);
 				signal?.removeEventListener("abort", onAbort);
-				feed(buffer);
+				feed(buffer + decoder.end());
 				resolve({ code, signal: exitSignal });
 			};
 			proc.on("close", finish);
@@ -202,6 +262,7 @@ export async function runChild({ spec, task, cwd, signal, onProgress, invocation
 			});
 		});
 
+		acc.finish();
 		const { result } = acc;
 		if (aborted) {
 			result.status = "aborted";
