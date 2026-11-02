@@ -78,20 +78,24 @@ function harness(mode = "tui") {
 
 test("monitor works with no onUpdate, persists costs, restores and clears on session replacement", () => {
   const h = harness();
-  const spec = { sessionId: "child", name: "review", model: "p/m", thinking: "high" };
+  const spec = { sessionId: "child", sessionFile: "/child/session.jsonl", name: "review", model: "p/m", thinking: "high" };
   h.handlers.get("session_start")({}, h.ctx);
-  h.monitor.dispatch(h.ctx, "codemode/1", spec)();
+  h.monitor.dispatch(h.ctx, "codemode/1", spec, "/child/workspace")();
   h.monitor.dispatch(h.ctx, "codemode/2", { ...spec, sessionId: "other" })();
   h.monitor.update("codemode/1", { usage: usage(.1), turns: 1, model: "p/actual", preview: "live text" });
   assert.match(h.render().join("\n"), /live text/);
   assert.match(h.render()[0], /2 active.*\$0\.1000/);
   h.monitor.finish("codemode/1", { usage: usage(.2), turns: 2, status: "completed", model: "p/actual" });
   assert.equal(h.saved[0].customType, WORKER_ENTRY);
+  assert.equal(h.saved[0].data.cwd, "/child/workspace");
+  assert.equal(h.saved[0].data.sessionFile, "/child/session.jsonl");
   assert.match(h.render()[0], /1 active.*\$0\.0000/);
   h.monitor.fail("codemode/2");
   assert.match(h.render().join("\n"), /✖ review.*error/);
   h.handlers.get("session_start")({}, h.ctx);
   assert.match(h.render().join("\n"), /p\/actual.*completed.*\$0\.2000/);
+  assert.equal(h.monitor.list()[0].cwd, "/child/workspace");
+  assert.equal(h.monitor.list()[0].sessionFile, "/child/session.jsonl");
   // A branch or new main session must not display abandoned worker records.
   h.handlers.get("session_tree")({}, { ...h.ctx, sessionManager: { getSessionId: () => "new", getBranch: () => [] } });
   assert.deepEqual(h.render(), []);

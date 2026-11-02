@@ -10,10 +10,11 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
+import { resolveLimits, type Limits } from "./limits.ts";
 
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 
-export interface SubagentParams {
+export interface SubagentParams extends Partial<Limits> {
 	task: string;
 	agent?: string;
 	systemPrompt?: string;
@@ -24,7 +25,7 @@ export interface SubagentParams {
 	cwd?: string;
 }
 
-export interface Spec {
+export interface Spec extends Limits {
 	name: string;
 	systemPrompt: string;
 	/** `provider/model-id` without the thinking suffix. */
@@ -146,6 +147,7 @@ export function resolveSpec(params: SubagentParams, dir = sessionsDir(), config 
 	const tools = parseList(params.tools) ?? base.tools;
 
 	return {
+		...resolveLimits(params),
 		name: clean(params.name) ?? base.name,
 		systemPrompt: base.systemPrompt,
 		model,

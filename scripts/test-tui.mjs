@@ -3,7 +3,7 @@
 // The provider is deterministic. No account, network, or model spend is needed.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -48,6 +48,16 @@ try {
   assert.doesNotMatch(done, /tokens ·/);
   // This is the key codemode boundary: script returned text only, not metadata.
   assert.match(done, /return runs\.map\(r => r\.text\)/);
+  assert.match(done, /F8 open subagent/);
+  // Oracle: opening a saved child must show its real transcript, issue no prompt,
+  // and leave the parent's session intact. Ctrl+D returns to that parent.
+  tmux("send-keys", "-t", session, "F8");
+  await until((text) => /open subagent/.test(text) && /worker-b · completed ·/.test(text), "F8 opens the native session picker");
+  tmux("send-keys", "-t", session, "Enter");
+  const opened = await until((text) => /Worker complete/.test(text) && !/Subagents ·/.test(text) && /worker-b • medium/.test(text), "open the actual child session without a model call");
+  assert.doesNotMatch(opened, /Fixture complete/);
+  tmux("send-keys", "-t", session, "C-d");
+  await until((text) => /Fixture complete/.test(text) && /Subagents · 0 active/.test(text), "exiting the child restores the parent TUI");
   tmux("send-keys", "-t", session, "-l", "/reload");
   tmux("send-keys", "-t", session, "Enter");
   const reloaded = await until((text) => /Reloaded keybindings/.test(text) && /✓ worker-a.*\$0\.0014/.test(text), "reload restores finished metadata");
@@ -56,6 +66,17 @@ try {
   tmux("send-keys", "-t", session, "Enter");
   const resumedLive = await until((text) => /2 active/.test(text) && /running Σ \$0\.005[0246]/.test(text), "resumed sessions include prior model costs without double counting");
   assert.match(resumedLive, /\$0\.002[567] reported/);
+  tmux("send-keys", "-t", session, "F8");
+  await until((text) => /worker-b · running ·/.test(text), "running sessions are available in the picker");
+  tmux("send-keys", "-t", session, "Enter");
+  await until((text) => /Worker complete/.test(text) && !/Subagents ·/.test(text) && /worker-[ab] • medium/.test(text), "open running child's saved history");
+  const forkHeaders = readdirSync(join(agentDir, "sessions"), { recursive: true })
+    .filter((file) => file.endsWith(".jsonl"))
+    .map((file) => JSON.parse(readFileSync(join(agentDir, "sessions", file), "utf8").split("\n")[0]))
+    .filter((header) => header.parentSession?.startsWith(join(agentDir, "subagent-sessions")));
+  assert.equal(forkHeaders.length, 1, "busy parent must open a persisted native fork");
+  assert.notEqual(forkHeaders[0].id, forkHeaders[0].parentSession.split("/").at(-1).replace(".jsonl", ""));
+  tmux("send-keys", "-t", session, "C-d");
   const resumed = await until((text) => /0 active/.test(text) && /✓ worker-a.*\$0\.0028/.test(text) && /✓ worker-b.*\$0\.0028/.test(text), "resumed-session final costs");
   assert.equal(resumed.split("\n").filter((line) => /[├└]─ ✓ worker-/.test(line)).length, 2);
   tmux("send-keys", "-t", session, "-l", "/new");

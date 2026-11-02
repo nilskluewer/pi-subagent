@@ -49,6 +49,19 @@ test("inline persona gets a fresh session; placeholders count as absent", () => 
   assert.equal(spec.sessionFile, path.join(dir, `${spec.sessionId}.jsonl`));
 });
 
+test("spending limits default to $10 and 100 turns and accept explicit positive values", () => {
+  const defaults = resolveSpec({ task: "t" }, tmp(), {});
+  assert.deepEqual([defaults.maxCost, defaults.maxTurns], [10, 100]);
+  const custom = resolveSpec({ task: "t", maxCost: 0.25, maxTurns: 7 }, tmp(), {});
+  assert.deepEqual([custom.maxCost, custom.maxTurns], [0.25, 7]);
+  for (const maxCost of [0, -1, NaN, Infinity, "1"]) {
+    assert.throws(() => resolveSpec({ task: "t", maxCost }, tmp(), {}), /maxCost/);
+  }
+  for (const maxTurns of [0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, "1"]) {
+    assert.throws(() => resolveSpec({ task: "t", maxTurns }, tmp(), {}), /maxTurns/);
+  }
+});
+
 test("at most one persona source", () => {
   assert.throws(() => resolveSpec({ task: "t", agent: "a", systemPrompt: "b" }, tmp(), {}), /at most one/);
 });

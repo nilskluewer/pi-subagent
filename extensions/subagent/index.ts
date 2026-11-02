@@ -17,6 +17,7 @@ import { type Usage, Type } from "@earendil-works/pi-ai";
 import { type ExtensionAPI, DEFAULT_MAX_BYTES, formatSize, truncateHead } from "@earendil-works/pi-coding-agent";
 import { type ChildResult, type Progress, runChild } from "./child.ts";
 import { setActiveToolsProvider } from "./inherited-tools.ts";
+import { createSubagentOpener } from "./open.ts";
 import { resolveSpec, sessionsDir, writeMeta } from "./spec.ts";
 import { createWorkerMonitor } from "./workers.ts";
 
@@ -34,6 +35,8 @@ const Params = Type.Object({
 	tools: Type.Optional(Type.String({ description: "Comma-separated tools the child may use. Omit to inherit the caller's active tools." })),
 	resume: Type.Optional(Type.String({ description: "Session id from an earlier result: continue that agent with its full history." })),
 	cwd: Type.Optional(Type.String({ description: "Working directory of the child. Default: the current directory." })),
+	maxCost: Type.Optional(Type.Number({ exclusiveMinimum: 0, description: "Reported USD stop threshold for this call. Default: 10." })),
+	maxTurns: Type.Optional(Type.Integer({ minimum: 1, description: "Maximum assistant responses for this call. Default: 100." })),
 });
 
 const Output = Type.Object({
@@ -80,8 +83,7 @@ export function buildContent(
 }
 
 export default function (pi: ExtensionAPI) {
-	// Children never get the tool: the parent orchestrates (see codemode). This also
-	// removes the need for depth limits and a child budget.
+	// Children never get the delegation tool; their launcher loads limits.ts.
 	if (process.env.PI_SUBAGENT) {
 		pi.on("session_start", () => {
 			// Exit when the parent dies, even if its kill never reached this process.
@@ -92,6 +94,12 @@ export default function (pi: ExtensionAPI) {
 	}
 	setActiveToolsProvider(() => pi.getActiveTools());
 	const workers = createWorkerMonitor(pi);
+	const openSubagent = createSubagentOpener(workers.list);
+	pi.registerShortcut("f8", { description: "open subagent", handler: openSubagent });
+	pi.registerCommand("open-subagent", {
+		description: "open subagent",
+		handler: (_args, ctx) => openSubagent(ctx),
+	});
 
 	pi.registerTool({
 		name: "subagent",
@@ -120,7 +128,7 @@ export default function (pi: ExtensionAPI) {
 					details: { sessionId: spec.sessionId },
 				});
 			};
-			const onStarted = workers.dispatch(ctx, toolCallId, spec);
+			const onStarted = workers.dispatch(ctx, toolCallId, spec, cwd);
 			let run: ChildResult;
 			try {
 				run = await runChild({ spec, task: params.task, cwd, signal, onProgress: send, onStarted });

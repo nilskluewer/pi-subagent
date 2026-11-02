@@ -12,6 +12,8 @@ const VISIBILITY_ENTRY = "subagent-worker-visibility";
 export interface Worker {
 	id: string;
 	sessionId: string;
+	sessionFile?: string;
+	cwd?: string;
 	name: string;
 	requestedModel?: string;
 	requestedThinking?: string;
@@ -54,7 +56,7 @@ export function renderWorkers(workers: Worker[], now: number, width: number): st
 	const done = [...latest.values()].filter((worker) => worker.status !== "running");
 	const activeSessions = new Set(active.map((worker) => worker.sessionId));
 	const activeCost = [...activeSessions].reduce((sum, id) => sum + sessionCost(workers, id), 0);
-	const lines = [`Subagents · ${active.length} active · running Σ ${money(activeCost)} reported`];
+	const lines = [`Subagents · ${active.length} active · running Σ ${money(activeCost)} reported · F8 open subagent`];
 	const shown = [...active, ...done.slice(-3)];
 	shown.forEach((worker, index) => {
 		const branch = index === shown.length - 1 ? "└─" : "├─";
@@ -160,8 +162,9 @@ export function createWorkerMonitor(pi: ExtensionAPI) {
 	});
 
 	return {
+		list: () => [...workers.values()],
 		/** Prepare before spawn, then mount only when spawn succeeds in the same session generation. */
-		dispatch(ctx: ExtensionContext, id: string, spec: Spec) {
+		dispatch(ctx: ExtensionContext, id: string, spec: Spec, cwd = ctx.cwd) {
 			if (parentSession === undefined) reset(ctx);
 			const expectedGeneration = generation;
 			const expectedSession = ctx.sessionManager.getSessionId();
@@ -170,7 +173,7 @@ export function createWorkerMonitor(pi: ExtensionAPI) {
 				if (expectedGeneration !== generation || expectedSession !== parentSession) return;
 				idleUserMessages = 0;
 				workers.set(id, {
-					id, sessionId: spec.sessionId, name: spec.name, requestedModel: spec.model, requestedThinking: spec.thinking,
+					id, sessionId: spec.sessionId, sessionFile: spec.sessionFile, cwd, name: spec.name, requestedModel: spec.model, requestedThinking: spec.thinking,
 					priorCost, startedAt: Date.now(), status: "running", progress: { usage: emptyUsage(), turns: 0 },
 				});
 				refresh();

@@ -8,8 +8,10 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { StringDecoder } from "node:string_decoder";
+import { fileURLToPath } from "node:url";
 import type { Usage } from "@earendil-works/pi-ai";
 import { inheritedToolsEnv } from "./inherited-tools.ts";
+import { resolveLimits } from "./limits.ts";
 import type { Spec } from "./spec.ts";
 
 export type Status = "completed" | "error" | "aborted";
@@ -155,7 +157,7 @@ export function createAccumulator() {
 	};
 }
 
-function piInvocation(args: string[]): { command: string; args: string[] } {
+export function piInvocation(args: string[]): { command: string; args: string[] } {
 	const script = process.argv[1];
 	if (script && !script.startsWith("/$bunfs/root/") && fs.existsSync(script)) {
 		return { command: process.execPath, args: [script, ...args] };
@@ -166,7 +168,7 @@ function piInvocation(args: string[]): { command: string; args: string[] } {
 }
 
 export function buildArgs(spec: Pick<Spec, "sessionFile" | "model" | "thinking" | "tools">, taskFile: string, promptFile?: string): string[] {
-	const args = ["--mode", "json", "-p", "--session", spec.sessionFile];
+	const args = ["--mode", "json", "-p", "--session", spec.sessionFile, "--extension", fileURLToPath(new URL("./limits.ts", import.meta.url))];
 	if (spec.model) args.push("--model", spec.model);
 	if (spec.thinking) args.push("--thinking", spec.thinking);
 	if (spec.tools?.length) args.push("--tools", spec.tools.join(","));
@@ -190,6 +192,7 @@ export interface RunOptions {
 
 export async function runChild({ spec, task, cwd, signal, onProgress, onStarted, invocation = piInvocation }: RunOptions): Promise<ChildResult> {
 	const acc = createAccumulator();
+	const limits = resolveLimits(spec);
 	const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-"));
 	try {
 		const taskFile = path.join(tmp, "task.md");
@@ -214,6 +217,8 @@ export async function runChild({ spec, task, cwd, signal, onProgress, onStarted,
 					PI_SUBAGENT: "1",
 					PI_SUBAGENT_NAME: spec.name,
 					PI_SUBAGENT_SESSION_ID: spec.sessionId,
+					PI_SUBAGENT_MAX_COST: String(limits.maxCost),
+					PI_SUBAGENT_MAX_TURNS: String(limits.maxTurns),
 					...inheritedToolsEnv(spec.tools),
 				},
 			});

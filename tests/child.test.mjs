@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import { buildArgs, createAccumulator, runChild } from "../extensions/subagent/child.ts";
 import { buildContent, describeUsage } from "../extensions/subagent/index.ts";
@@ -87,11 +88,13 @@ test("parallel tool progress survives another tool ending", () => {
   assert.match(acc.progress().tool, /read.*a.ts/);
 });
 
-test("buildArgs keeps the task out of argv and omits unset options", () => {
-  assert.deepEqual(buildArgs({ sessionFile: "/s.jsonl" }, "/t.md"), ["--mode", "json", "-p", "--session", "/s.jsonl", "@/t.md"]);
+const limitsExtension = fileURLToPath(new URL("../extensions/subagent/limits.ts", import.meta.url));
+
+test("buildArgs always loads spending limits, keeps the task out of argv and omits unset options", () => {
+  assert.deepEqual(buildArgs({ sessionFile: "/s.jsonl" }, "/t.md"), ["--mode", "json", "-p", "--session", "/s.jsonl", "--extension", limitsExtension, "@/t.md"]);
   assert.deepEqual(
     buildArgs({ sessionFile: "/s.jsonl", model: "a/b", thinking: "high", tools: ["read", "grep"] }, "/t.md", "/p.md"),
-    ["--mode", "json", "-p", "--session", "/s.jsonl", "--model", "a/b", "--thinking", "high", "--tools", "read,grep", "--append-system-prompt", "/p.md", "@/t.md"],
+    ["--mode", "json", "-p", "--session", "/s.jsonl", "--extension", limitsExtension, "--model", "a/b", "--thinking", "high", "--tools", "read,grep", "--append-system-prompt", "/p.md", "@/t.md"],
   );
 });
 

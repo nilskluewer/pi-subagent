@@ -1,6 +1,6 @@
 {
   "name": "@nilskluewer/pi-subagent",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "description": "Minimal subagent tool for Pi: runs one task in an isolated pi child process, reports the exact cost (counted in the session totals), and leaves orchestration to codemode.",
   "type": "module",
   "keywords": [
